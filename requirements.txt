@@ -1,0 +1,24 @@
+# Core numerical and scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Audio I/O and processing
+soundfile>=0.12.0
+
+# Deep learning and voice embeddings
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Datasets and download helpers
+datasets>=2.14.0
+huggingface_hub>=0.19.0
+tqdm>=4.65.0
+
+# Visualization and exploration
+matplotlib>=3.6.0
+jupyter>=1.0.0
+ipykernel>=6.20.0
+
+# Testing and development
+pytest>=7.4.0
+
