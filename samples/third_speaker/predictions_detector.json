@@ -1,0 +1,156 @@
+{
+  "A": [
+    {
+      "start": 0.57,
+      "end": 0.81,
+      "label": "own",
+      "score": 0.9173
+    },
+    {
+      "start": 0.94,
+      "end": 1.1,
+      "label": "own",
+      "score": 0.8333
+    },
+    {
+      "start": 1.14,
+      "end": 1.63,
+      "label": "own",
+      "score": 0.9297
+    },
+    {
+      "start": 2.55,
+      "end": 2.65,
+      "label": "leak",
+      "score": 0.9589
+    },
+    {
+      "start": 2.83,
+      "end": 2.93,
+      "label": "leak",
+      "score": 0.9282
+    },
+    {
+      "start": 3.04,
+      "end": 3.4,
+      "label": "leak",
+      "score": 0.9481
+    },
+    {
+      "start": 3.46,
+      "end": 3.97,
+      "label": "leak",
+      "score": 0.8341
+    },
+    {
+      "start": 3.53,
+      "end": 3.65,
+      "label": "own",
+      "score": 0.6148
+    },
+    {
+      "start": 5.01,
+      "end": 5.58,
+      "label": "own",
+      "score": 0.8437
+    },
+    {
+      "start": 5.67,
+      "end": 5.9,
+      "label": "own",
+      "score": 0.8054
+    },
+    {
+      "start": 6.21,
+      "end": 6.46,
+      "label": "own",
+      "score": 0.7976
+    },
+    {
+      "start": 7.92,
+      "end": 8.01,
+      "label": "leak",
+      "score": 0.9659
+    },
+    {
+      "start": 8.37,
+      "end": 8.73,
+      "label": "leak",
+      "score": 0.9624
+    },
+    {
+      "start": 8.92,
+      "end": 9.07,
+      "label": "leak",
+      "score": 0.9391
+    },
+    {
+      "start": 9.41,
+      "end": 9.5,
+      "label": "leak",
+      "score": 0.8731
+    }
+  ],
+  "B": [
+    {
+      "start": 2.55,
+      "end": 2.71,
+      "label": "own",
+      "score": 0.9771
+    },
+    {
+      "start": 2.85,
+      "end": 3.38,
+      "label": "own",
+      "score": 0.9761
+    },
+    {
+      "start": 3.41,
+      "end": 3.51,
+      "label": "own",
+      "score": 0.9506
+    },
+    {
+      "start": 3.62,
+      "end": 3.9,
+      "label": "own",
+      "score": 0.9671
+    },
+    {
+      "start": 4.24,
+      "end": 4.33,
+      "label": "own",
+      "score": 0.9867
+    },
+    {
+      "start": 7.79,
+      "end": 8.78,
+      "label": "own",
+      "score": 0.9686
+    },
+    {
+      "start": 8.94,
+      "end": 9.28,
+      "label": "own",
+      "score": 0.9429
+    },
+    {
+      "start": 9.43,
+      "end": 9.56,
+      "label": "own",
+      "score": 0.9627
+    },
+    {
+      "start": 9.75,
+      "end": 9.87,
+      "label": "own",
+      "score": 0.973
+    },
+    {
+      "start": 9.94,
+      "end": 10.03,
+      "label": "own",
+      "score": 0.9631
+    }
+  ]
+}

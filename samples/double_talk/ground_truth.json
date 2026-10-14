@@ -1,0 +1,150 @@
+{
+  "A": [
+    {
+      "start": 0.5,
+      "end": 2.6924,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 1.9852,
+      "end": 3.7244,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 2.6939,
+      "end": 4.7298,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 3.7346,
+      "end": 5.0019,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 3.7477,
+      "end": 5.8074,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 4.8801,
+      "end": 6.6834,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 5.6384,
+      "end": 7.5179,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 6.7867,
+      "end": 9.1653,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 8.3639,
+      "end": 10.7342,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 10.2909,
+      "end": 11.4999,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 10.4178,
+      "end": 11.7656,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 11.1804,
+      "end": 11.7874,
+      "label": "leak",
+      "score": 1.0
+    }
+  ],
+  "B": [
+    {
+      "start": 0.54,
+      "end": 2.7324,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 1.6977,
+      "end": 3.4369,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 2.7339,
+      "end": 4.7698,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 3.4471,
+      "end": 4.7144,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 3.7877,
+      "end": 5.8474,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 4.5926,
+      "end": 6.3959,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 5.6784,
+      "end": 7.5579,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 6.4992,
+      "end": 8.8778,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 8.4039,
+      "end": 10.7742,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 10.1303,
+      "end": 11.4781,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 10.3309,
+      "end": 11.5399,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 10.8929,
+      "end": 11.4999,
+      "label": "own",
+      "score": 1.0
+    }
+  ]
+}

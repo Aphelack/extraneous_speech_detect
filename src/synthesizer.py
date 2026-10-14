@@ -372,7 +372,8 @@ class TelephoneDialogueSynthesizer:
             actual_dur = (e_idx - s_idx) / sr
 
             utt_a = get_utterance("A", actual_dur)
-            timeline_a[s_idx:e_idx] += utt_a[: e_idx - s_idx]
+            seg_len_a = min(len(utt_a), e_idx - s_idx)
+            timeline_a[s_idx : s_idx + seg_len_a] += utt_a[:seg_len_a]
 
             start_a_sec = round(curr_time, 4)
             end_a_sec = round(curr_time + actual_dur, 4)
@@ -400,7 +401,8 @@ class TelephoneDialogueSynthesizer:
             actual_dur_b = (e_idx_b - s_idx_b) / sr
 
             utt_b = get_utterance("B", actual_dur_b)
-            timeline_b[s_idx_b:e_idx_b] += utt_b[: e_idx_b - s_idx_b]
+            seg_len_b = min(len(utt_b), e_idx_b - s_idx_b)
+            timeline_b[s_idx_b : s_idx_b + seg_len_b] += utt_b[:seg_len_b]
 
             start_b_sec = round(curr_time, 4)
             end_b_sec = round(curr_time + actual_dur_b, 4)
@@ -423,7 +425,8 @@ class TelephoneDialogueSynthesizer:
             actual_dur_3 = (e_idx_3 - s_idx_3) / sr
 
             utt_3 = get_utterance("third", actual_dur_3)
-            timeline_3[s_idx_3:e_idx_3] += utt_3[: e_idx_3 - s_idx_3]
+            seg_len_3 = min(len(utt_3), e_idx_3 - s_idx_3)
+            timeline_3[s_idx_3 : s_idx_3 + seg_len_3] += utt_3[:seg_len_3]
 
             # Third speaker talks near Track A
             gt_intervals["A"].append({
