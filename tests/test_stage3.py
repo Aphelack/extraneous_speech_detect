@@ -87,3 +87,4 @@ def test_cleaner_reduces_leak_and_preserves_voice():
     print(f"  After cleaning:  {sim_cleaned:.4f}")
 
     assert sim_cleaned >= sim_noisy - 0.02, "Cleaning must not degrade voice representation of owner!"
+

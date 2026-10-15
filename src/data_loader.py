@@ -6,7 +6,7 @@ so that speakers in validation and testing never leak into training.
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import scipy.signal as signal
@@ -18,8 +18,21 @@ from src.config import SAMPLE_RATE
 class RealSpeechLoader:
     """Loads and caches real speech utterances grouped by speaker ID."""
 
-    def __init__(self, data_root: str = "data/cmuarctic", target_sr: int = SAMPLE_RATE):
-        self.data_root = Path(data_root)
+    def __init__(self, data_root: Union[str, Path] = "data/cmuarctic", target_sr: int = SAMPLE_RATE):
+        path = Path(data_root)
+        if not path.exists():
+            # If called from a subdirectory (e.g. notebooks/ or scripts/), resolve relative to repo root
+            repo_root = Path(__file__).resolve().parent.parent
+            if (repo_root / data_root).exists():
+                path = repo_root / data_root
+            else:
+                curr = Path.cwd().resolve()
+                for parent in [curr] + list(curr.parents):
+                    candidate = parent / data_root
+                    if candidate.exists():
+                        path = candidate
+                        break
+        self.data_root = path
         self.target_sr = target_sr
 
     def discover_speakers(self) -> Dict[str, List[Path]]:
@@ -105,3 +118,4 @@ class RealSpeechLoader:
             except KeyError:
                 pass
         return pool
+

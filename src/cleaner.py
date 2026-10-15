@@ -200,3 +200,4 @@ def compute_spectral_embedding(signal_1d: np.ndarray, sample_rate: int = SAMPLE_
     vec = np.log10(np.maximum(np.array(bank_energies), 1e-10))
     norm = np.linalg.norm(vec) + 1e-10
     return (vec / norm).astype(np.float32)
+

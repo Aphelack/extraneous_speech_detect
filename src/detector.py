@@ -78,6 +78,18 @@ class ExtraneousSpeechDetector:
         self.std = None
 
         weights_file = Path(self.config.weights_path)
+        if not weights_file.exists():
+            repo_root = Path(__file__).resolve().parent.parent
+            if (repo_root / self.config.weights_path).exists():
+                weights_file = repo_root / self.config.weights_path
+            else:
+                curr = Path.cwd().resolve()
+                for parent in [curr] + list(curr.parents):
+                    candidate = parent / self.config.weights_path
+                    if candidate.exists():
+                        weights_file = candidate
+                        break
+
         if weights_file.exists():
             try:
                 ckpt = torch.load(weights_file, map_location="cpu", weights_only=False)
