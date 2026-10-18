@@ -27,6 +27,8 @@ samples/
 # Jupyter Notebook
 .ipynb_checkpoints
 */.ipynb_checkpoints/*
+notebooks/pipeline_*.wav
+notebooks/pipeline_*.json
 
 # IDE and OS
 .vscode/
