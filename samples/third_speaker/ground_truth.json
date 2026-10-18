@@ -2,58 +2,70 @@
   "A": [
     {
       "start": 0.5,
-      "end": 1.787,
+      "end": 1.8456,
       "label": "own",
       "score": 1.0
     },
     {
-      "start": 2.6291,
-      "end": 4.5961,
+      "start": 2.6157,
+      "end": 4.3242,
       "label": "leak",
       "score": 1.0
     },
     {
-      "start": 3.1407,
-      "end": 4.1485,
+      "start": 2.7271,
+      "end": 3.9224,
       "label": "third",
       "score": 1.0
     },
     {
-      "start": 4.9979,
-      "end": 7.1744,
+      "start": 4.617,
+      "end": 6.4505,
       "label": "own",
       "score": 1.0
     },
     {
-      "start": 7.8437,
-      "end": 10.2924,
+      "start": 7.0132,
+      "end": 9.2413,
       "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 9.7386,
+      "end": 11.1097,
+      "label": "own",
       "score": 1.0
     }
   ],
   "B": [
     {
       "start": 0.54,
-      "end": 1.827,
+      "end": 1.8856,
       "label": "leak",
       "score": 1.0
     },
     {
-      "start": 2.5108,
-      "end": 4.4778,
+      "start": 2.3611,
+      "end": 4.0696,
       "label": "own",
       "score": 1.0
     },
     {
-      "start": 5.0379,
-      "end": 7.2144,
+      "start": 4.657,
+      "end": 6.4905,
       "label": "leak",
       "score": 1.0
     },
     {
-      "start": 7.7254,
-      "end": 10.1741,
+      "start": 6.7586,
+      "end": 8.9867,
       "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 9.7786,
+      "end": 11.1497,
+      "label": "leak",
       "score": 1.0
     }
   ]

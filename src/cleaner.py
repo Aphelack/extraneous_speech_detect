@@ -149,12 +149,20 @@ class TelephoneAudioCleaner:
 
     def _estimate_leakage(self, mag_a: np.ndarray, aligned_b: np.ndarray, p_own: np.ndarray, p_leak: np.ndarray) -> np.ndarray:
         bins, frames = mag_a.shape
-        coefficient = np.full(bins, 0.2, dtype=np.float32)
+        aligned_energy = np.mean(aligned_b ** 2, axis=0)
+        noise_b_floor = float(np.percentile(aligned_energy, 5))
+        active_reference = aligned_energy > max(noise_b_floor * 6.0, 1e-10)
+        if np.any(active_reference):
+            ratios = mag_a[:, active_reference] / (aligned_b[:, active_reference] + 1e-6)
+            coefficient = np.percentile(ratios, 25, axis=1).astype(np.float32)
+        else:
+            coefficient = np.full(bins, 0.2, dtype=np.float32)
+        coefficient = np.clip(coefficient, 0.08, 0.85)
         estimate = np.zeros_like(mag_a, dtype=np.float32)
         for t in range(frames):
             if p_leak[t] > 0.5 and p_own[t] < 0.2:
                 ratio = mag_a[:, t] / (aligned_b[:, t] + 1e-6)
-                coefficient = 0.95 * coefficient + 0.05 * ratio
+                coefficient = 0.95 * coefficient + 0.05 * np.clip(ratio, 0.08, 0.85)
             estimate[:, t] = coefficient * aligned_b[:, t]
         return estimate
 
@@ -222,23 +230,35 @@ class TelephoneAudioCleaner:
 
         neural_gain = np.clip(self.filterbank.T @ bands, 0.0, 1.0)
         analytic_gain = np.sqrt(
-            np.maximum(mag_a ** 2 - 1.3 * leak_estimate ** 2, 0.0)
+            np.maximum(mag_a ** 2 - 2.0 * leak_estimate ** 2, 0.0)
             / (mag_a ** 2 + 1e-8)
         )
-        analytic_gain = np.clip(analytic_gain, 0.30, 1.0)
-        double_talk_gain = np.clip(0.5 * neural_gain + 0.5 * analytic_gain, 0.30, 1.0)
+        analytic_gain = np.clip(analytic_gain, 0.0, 1.0)
+        double_talk_gain = np.clip(0.5 * neural_gain + 0.5 * analytic_gain, 0.04, 1.0)
         noise_floor = np.percentile(mag_a, self.config.noise_percentile, axis=1, keepdims=True)
         leak_ext = maximum_filter1d(p_leak, size=20, mode="nearest", origin=-9)
+        frame_energy = np.mean(mag_a ** 2, axis=0)
+        aligned_energy = np.mean(np.abs(aligned_b) ** 2, axis=0)
+        floor_energy = float(np.mean(noise_floor ** 2))
+        own_active = (p_own >= 0.35) & (frame_energy > floor_energy)
         pure_own = leak_ext < 0.20
-        pure_leak = (p_own < 0.22) & (leak_ext >= 0.30)
-        double_talk = (p_own >= 0.22) & (leak_ext >= 0.20)
+        pure_leak = (~own_active) & (leak_ext >= 0.25)
+        tail_pure_leak = (leak_ext >= 0.60) & (frame_energy < 0.75 * aligned_energy)
+        pure_leak |= tail_pure_leak
+        double_talk = own_active & (leak_ext >= 0.20)
+
+        leak_dominates = leak_estimate > 0.7 * mag_a
+        owner_dominates = mag_a > 1.8 * leak_estimate
+        double_talk_gain[leak_dominates] = np.minimum(double_talk_gain[leak_dominates], 0.04)
+        double_talk_gain[owner_dominates] = np.maximum(double_talk_gain[owner_dominates], 0.85)
+        double_talk_gain = np.clip(double_talk_gain, 0.04, 1.0)
 
         gain = np.ones_like(mag_a, dtype=np.float32)
         gain[:, double_talk] = double_talk_gain[:, double_talk]
         gain[:, pure_leak] = np.clip(
             noise_floor / (mag_a[:, pure_leak] + 1e-8),
             0.015,
-            0.05,
+            0.02,
         )
         gain = np.clip(gain, 0.0, 1.0)
         cleaned_mag = np.maximum(mag_a * gain, noise_floor)

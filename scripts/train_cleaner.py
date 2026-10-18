@@ -22,7 +22,7 @@ from src.synthesizer import TelephoneDialogueSynthesizer
 
 def train_cleaner(
     weights_path: str = "models/cleaner_weights.pt",
-    dialogues_per_scenario: int = 12,
+    dialogues_per_scenario: int = 48,
     epochs: int = 100,
     lr: float = 0.005,
     seed: int = 42,
@@ -129,4 +129,4 @@ def train_cleaner(
 
 
 if __name__ == "__main__":
-    train_cleaner()
+    train_cleaner(dialogues_per_scenario=48)

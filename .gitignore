@@ -21,6 +21,8 @@ data/
 *.wav
 *.flac
 *.mp3
+*/*.pt
+samples/
 
 # Jupyter Notebook
 .ipynb_checkpoints

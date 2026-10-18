@@ -437,9 +437,10 @@ class VoxCeleb1ArrowLoader:
 
 
 class CombinedSpeechLoader:
-    """Combines Russian speech (data/russian_speech) and VoxCeleb1 test split.
+    """Provide Russian speakers for dialogue synthesis.
 
-    Provides 47 distinct speakers total, with strict disjoint Train (29 spk) and Test (18 spk) splits.
+    VoxCeleb remains available through its own loader for embedding checks,
+    but is never selected as a dialogue source.
     """
 
     def __init__(
@@ -488,57 +489,34 @@ class CombinedSpeechLoader:
             raise KeyError(f"Unknown speaker: {speaker_id}")
 
     def get_disjoint_splits(self) -> Dict[str, List[str]]:
-        """Return strictly disjoint train and test speaker sets.
-
-        Train: ru_spk_1..4 + 25 VoxCeleb speakers (29 total)
-        Test:  ru_spk_5..7 + 15 VoxCeleb speakers (18 total)
-        """
+        """Return strictly disjoint Russian train and test speaker sets."""
         ru_spks = sorted([k for k in self.discover_speakers().keys() if k.startswith("ru_")])
-        vox_spks = sorted([k for k in self.discover_speakers().keys() if k.startswith("vox_")])
-
         ru_train = ru_spks[:4]
         ru_test = ru_spks[4:]
 
-        vox_train = vox_spks[:25]
-        vox_test = vox_spks[25:]
-
         return {
-            "train": ru_train + vox_train,
-            "test": ru_test + vox_test,
+            "train": ru_train,
+            "test": ru_test,
         }
 
     def sample_dialogue_speakers(
         self,
         split: str = "train",
-        russian_prob: float = 0.80,
+        russian_prob: float = 1.0,
         rng: Optional[np.random.RandomState] = None,
     ) -> Tuple[str, str, Optional[str]]:
-        """Sample speaker IDs for dialogue with 80% preference for Russian speakers.
-
-        Russian speech is prioritized for Channel A & B owners, while VoxCeleb is sampled
-        20% of the time (or used for third_speaker).
-        """
+        """Sample three Russian speakers from the requested split."""
         if rng is None:
             rng = np.random.RandomState()
 
         splits = self.get_disjoint_splits()
-        spk_set = splits[split]
-        ru_spks = [s for s in spk_set if s.startswith("ru_")]
-        vox_spks = [s for s in spk_set if s.startswith("vox_")]
-
-        # Channel A & B
-        if ru_spks and (rng.rand() < russian_prob or not vox_spks):
-            # Pick Russian speakers
-            chosen = rng.choice(ru_spks, size=min(2, len(ru_spks)), replace=False)
-            sa = str(chosen[0])
-            sb = str(chosen[1]) if len(chosen) > 1 else str(chosen[0])
-        else:
-            chosen = rng.choice(vox_spks, size=min(2, len(vox_spks)), replace=False)
-            sa = str(chosen[0])
-            sb = str(chosen[1]) if len(chosen) > 1 else str(chosen[0])
-
-        # Third speaker: pick from remaining
-        remaining = [s for s in spk_set if s != sa and s != sb]
+        ru_spks = [s for s in splits[split] if s.startswith("ru_")]
+        if len(ru_spks) < 2:
+            raise RuntimeError(f"Need at least two Russian speakers in {split}, found {ru_spks}")
+        chosen = rng.choice(ru_spks, size=min(3, len(ru_spks)), replace=False)
+        sa = str(chosen[0])
+        sb = str(chosen[1])
+        remaining = [s for s in ru_spks if s != sa and s != sb]
         st = str(rng.choice(remaining)) if remaining else None
 
         return sa, sb, st
@@ -550,7 +528,9 @@ class CombinedSpeechLoader:
         speaker_third: Optional[str] = None,
         max_per_speaker: int = 50,
     ) -> Dict[str, List[np.ndarray]]:
-        spks = sorted(self.discover_speakers().keys())
+        spks = sorted(s for s in self.discover_speakers().keys() if s.startswith("ru_"))
+        if len(spks) < 2:
+            raise RuntimeError("Russian dialogue pool requires at least two Russian speakers")
         sa = speaker_a or spks[0]
         sb = speaker_b or (spks[1] if len(spks) > 1 else spks[0])
         st = speaker_third or (spks[2] if len(spks) > 2 else None)

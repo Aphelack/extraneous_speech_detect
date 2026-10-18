@@ -495,9 +495,9 @@ class TelephoneDialogueSynthesizer:
                 candidates = utterance_pool[spk]
                 utt = candidates[self.rng.randint(len(candidates))].copy()
 
-                # Speed / pitch perturbation (factor uniform(0.92, 1.08)) to augment vocal tracts
+                # Speed / pitch perturbation to diversify Russian speaker timbres.
                 if self.rng.rand() < 0.70:
-                    factor = float(self.rng.uniform(0.92, 1.08))
+                    factor = float(self.rng.uniform(0.88, 1.12))
                     num_resampled = int(round(len(utt) / factor))
                     if num_resampled > 160:
                         utt = signal.resample(utt, num_resampled).astype(np.float32)

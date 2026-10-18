@@ -98,10 +98,10 @@ class DetectorConfig:
     frame_sec: float = FRAME_DURATION_SEC
     threshold_own: float = 0.50
     threshold_leak: float = 0.50
-    threshold_third: float = 0.52
+    threshold_third: float = 0.38
     smoothing_window_frames: int = 5  # 50 ms temporal smoothing
     min_segment_sec: float = 0.08     # 80 ms minimum duration
-    min_segment_third_sec: float = 0.22  # 220 ms minimum duration for third
+    min_segment_third_sec: float = 0.15  # 150 ms minimum duration for third
     vad_energy_threshold_db: float = -48.0
 
 
@@ -222,8 +222,8 @@ class ExtraneousSpeechDetector:
 
             # A third speaker is local to this channel: cross-channel evidence
             # or a close owner-anchor match is incompatible with that label.
-            third_is_remote = (p_leak > 0.45) | (gcc_peak > 0.35) | (ild < -3.0)
-            third_is_owner = (ild > 6.0) & (anchor_cos_dist < 0.32)
+            third_is_remote = (p_leak > 0.65) & (gcc_peak > 0.45)
+            third_is_owner = (ild > 8.0) & (anchor_cos_dist < 0.25)
             p_third = np.where(third_is_remote | third_is_owner, 0.0, p_third)
 
             # Temporal median filtering (50 ms)
@@ -290,14 +290,7 @@ class ExtraneousSpeechDetector:
                 scores=ch_probs[LABEL_THIRD],
                 min_duration_sec=min_dur_third,
             )
-            intervals_ch.extend(
-                item
-                for item in third_intervals
-                if float(np.max(ch_probs[LABEL_THIRD][
-                    int(item["start"] / self.config.frame_sec):
-                    int(item["end"] / self.config.frame_sec)
-                ])) >= 0.65
-            )
+            intervals_ch.extend(third_intervals)
 
             intervals_ch.sort(key=lambda x: x["start"])
             results[ch] = intervals_ch

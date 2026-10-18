@@ -2,25 +2,25 @@
   "A": [
     {
       "start": 0.5,
-      "end": 2.4221,
+      "end": 2.046,
       "label": "own",
       "score": 1.0
     },
     {
-      "start": 3.1985,
-      "end": 5.6835,
+      "start": 2.7337,
+      "end": 5.1027,
       "label": "leak",
       "score": 1.0
     },
     {
-      "start": 5.7639,
-      "end": 7.3798,
+      "start": 5.3179,
+      "end": 7.1659,
       "label": "own",
       "score": 1.0
     },
     {
-      "start": 8.3042,
-      "end": 9.768,
+      "start": 7.8602,
+      "end": 9.7343,
       "label": "leak",
       "score": 1.0
     }
@@ -28,25 +28,25 @@
   "B": [
     {
       "start": 0.54,
-      "end": 2.4621,
+      "end": 2.086,
       "label": "leak",
       "score": 1.0
     },
     {
-      "start": 2.9305,
-      "end": 5.4155,
+      "start": 2.4993,
+      "end": 4.8683,
       "label": "own",
       "score": 1.0
     },
     {
-      "start": 5.8039,
-      "end": 7.4198,
+      "start": 5.3579,
+      "end": 7.2059,
       "label": "leak",
       "score": 1.0
     },
     {
-      "start": 8.0362,
-      "end": 9.5,
+      "start": 7.6258,
+      "end": 9.4999,
       "label": "own",
       "score": 1.0
     }

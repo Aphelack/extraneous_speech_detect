@@ -28,7 +28,7 @@ from src.synthesizer import TelephoneDialogueSynthesizer
 
 def train_detector(
     weights_path: str = "models/detector_weights.pt",
-    dialogues_per_scenario: int = 12,
+    dialogues_per_scenario: int = 48,
     epochs: int = 150,
     lr: float = 0.005,
     seed: int = 42,
@@ -51,7 +51,7 @@ def train_detector(
 
     scenarios = ["normal", "double_talk", "high_leak_lt_10db", "path_drift", "third_speaker"]
     
-    # 12 dialogues per scenario = 60 total dialogues.
+    # 48 dialogues per scenario = 240 total Russian dialogues.
     scenario_counts = {sc: dialogues_per_scenario for sc in scenarios}
 
     dialogues_x: List[np.ndarray] = []
@@ -180,4 +180,4 @@ def train_detector(
 
 
 if __name__ == "__main__":
-    train_detector(dialogues_per_scenario=12, epochs=150)
+    train_detector(dialogues_per_scenario=48, epochs=150)

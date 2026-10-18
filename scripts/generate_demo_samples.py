@@ -7,8 +7,13 @@ comprehensive metrics.
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict
+
+repo_root = Path(__file__).resolve().parent.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
 import numpy as np
 
@@ -31,16 +36,19 @@ def main():
     print("=" * 70)
 
     # 1. Load real speech utterances
-    loader = RealSpeechLoader(data_root="data/cmuarctic")
-    speakers = loader.discover_speakers()
-    print(f"Available real speakers in dataset: {list(speakers.keys())}")
-
-    speaker_a = "aew" if "aew" in speakers else list(speakers.keys())[0]
-    speaker_b = "slt" if "slt" in speakers else (list(speakers.keys())[1] if len(speakers) > 1 else speaker_a)
-    speaker_3 = "bdl" if "bdl" in speakers else None
-
-    print(f"Assigning speakers -> Track A (Owner): {speaker_a}, Track B (Counterpart): {speaker_b}, Third: {speaker_3}")
-    pool = loader.build_utterance_pool(speaker_a=speaker_a, speaker_b=speaker_b, speaker_third=speaker_3, max_per_speaker=30)
+    loader = RealSpeechLoader(data_root="data/russian_speech")
+    rng = np.random.RandomState(2026)
+    speaker_a, speaker_b, speaker_3 = loader.sample_dialogue_speakers("test", rng=rng)
+    print(
+        "Russian speakers -> "
+        f"Track A: {speaker_a}, Track B: {speaker_b}, Third: {speaker_3}"
+    )
+    pool = loader.build_utterance_pool(
+        speaker_a=speaker_a,
+        speaker_b=speaker_b,
+        speaker_third=speaker_3,
+        max_per_speaker=30,
+    )
 
     synth = TelephoneDialogueSynthesizer(seed=2026)
     detector = ExtraneousSpeechDetector()
@@ -51,6 +59,7 @@ def main():
         ("normal", 10.0, "Normal turn-taking with moderate leak"),
         ("double_talk", 12.0, "Simultaneous double talk between speakers A and B"),
         ("high_leak_lt_10db", 10.0, "Severe leak (< 10 dB attenuation)"),
+        ("path_drift", 10.0, "Slowly drifting acoustic leakage path"),
         ("third_speaker", 12.0, "Third speaker present near Track A microphone"),
     ]
 
