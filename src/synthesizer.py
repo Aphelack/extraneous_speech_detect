@@ -18,6 +18,7 @@ Implements the physical transmission and leakage model described in the specific
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -76,6 +77,146 @@ def generate_synthetic_rir(
     # Normalize peak to 1.0
     rir = rir / (np.max(np.abs(rir)) + 1e-10)
     return rir.astype(np.float32)
+
+
+class RIRManager:
+    """Manages real and simulated RIRs and real noises from OpenSLR 28.
+
+    Falls back to generate_synthetic_rir if the dataset directory is absent.
+    """
+
+    def __init__(
+        self,
+        data_root: Union[str, Path] = "data/rirs_noises/RIRS_NOISES",
+        target_sr: int = SAMPLE_RATE,
+    ):
+        self.target_sr = target_sr
+        self.data_root = Path(data_root)
+        if not self.data_root.exists():
+            repo_root = Path(__file__).resolve().parent.parent
+            self.data_root = repo_root / data_root
+
+        self.available = self.data_root.exists()
+        self._owner_rirs: List[Path] = []
+        self._third_rirs: List[Path] = []
+        self._leak_rirs: List[Path] = []
+        self._noise_files: List[Path] = []
+
+        if self.available:
+            self._index_files()
+
+    def _index_files(self):
+        root = self.data_root
+        real_dir = root / "real_rirs_isotropic_noises"
+        sim_dir = root / "simulated_rirs"
+        noise_dir = root / "pointsource_noises"
+
+        if real_dir.exists():
+            self._owner_rirs.extend(list(real_dir.glob("*ane*.wav")))
+            self._third_rirs.extend(list(real_dir.glob("*ofc*.wav")))
+            self._third_rirs.extend(list(real_dir.glob("*e2b*.wav")))
+            self._leak_rirs.extend(list(real_dir.glob("RWCP_type*.wav")))
+            self._noise_files.extend(list(real_dir.glob("*noise*.wav")))
+
+        if sim_dir.exists():
+            small = list((sim_dir / "smallroom").glob("*/*.wav"))
+            med = list((sim_dir / "mediumroom").glob("*/*.wav"))
+            large = list((sim_dir / "largeroom").glob("*/*.wav"))
+            self._owner_rirs.extend(small[:300])
+            self._third_rirs.extend(med[:300] + large[:300])
+            self._leak_rirs.extend(small[300:500] if len(small) > 500 else small[:200])
+
+        if noise_dir.exists():
+            self._noise_files.extend(list(noise_dir.glob("*.wav"))[:100])
+
+    def _load_wav_as_rir(self, path: Path, max_len_sec: float = 0.5) -> np.ndarray:
+        import soundfile as sf
+        data, orig_sr = sf.read(str(path))
+        if data.ndim > 1:
+            data = data[:, 0]
+        if orig_sr != self.target_sr:
+            data = signal.resample_poly(data, self.target_sr // 1000, orig_sr // 1000)
+        max_samples = int(self.target_sr * max_len_sec)
+        if len(data) > max_samples:
+            data = data[:max_samples]
+        peak = np.max(np.abs(data))
+        if peak > 1e-6:
+            data = data / peak
+        return data.astype(np.float32)
+
+    def get_owner_rir(self, rng: Optional[np.random.RandomState] = None) -> np.ndarray:
+        if self.available and self._owner_rirs:
+            if rng is None:
+                rng = np.random.RandomState()
+            p = self._owner_rirs[rng.randint(len(self._owner_rirs))]
+            try:
+                rir = self._load_wav_as_rir(p, max_len_sec=0.25)
+                # Boost direct path to guarantee high DRR for close-talk microphone
+                direct_idx = int(np.argmax(np.abs(rir)))
+                rir[direct_idx] = np.sign(rir[direct_idx]) * max(abs(rir[direct_idx]), 1.5)
+                return (rir / np.max(np.abs(rir))).astype(np.float32)
+            except Exception:
+                pass
+        return generate_synthetic_rir(self.target_sr, t60_sec=0.18, direct_to_reverberant_ratio_db=15.0, rng=rng)
+
+    def get_third_speaker_rir(self, rng: Optional[np.random.RandomState] = None) -> np.ndarray:
+        if self.available and self._third_rirs:
+            if rng is None:
+                rng = np.random.RandomState()
+            p = self._third_rirs[rng.randint(len(self._third_rirs))]
+            try:
+                return self._load_wav_as_rir(p, max_len_sec=0.50)
+            except Exception:
+                pass
+        return generate_synthetic_rir(self.target_sr, t60_sec=0.45, direct_to_reverberant_ratio_db=3.0, rng=rng)
+
+    def get_leakage_rir(self, rng: Optional[np.random.RandomState] = None) -> np.ndarray:
+        if self.available and self._leak_rirs:
+            if rng is None:
+                rng = np.random.RandomState()
+            p = self._leak_rirs[rng.randint(len(self._leak_rirs))]
+            try:
+                return self._load_wav_as_rir(p, max_len_sec=0.30)
+            except Exception:
+                pass
+        return generate_synthetic_rir(self.target_sr, t60_sec=0.22, direct_to_reverberant_ratio_db=8.0, rng=rng)
+
+    def add_realistic_noise(
+        self,
+        x: np.ndarray,
+        snr_db: float = 25.0,
+        rng: Optional[np.random.RandomState] = None,
+    ) -> np.ndarray:
+        if self.available and self._noise_files:
+            if rng is None:
+                rng = np.random.RandomState()
+            p = self._noise_files[rng.randint(len(self._noise_files))]
+            try:
+                import soundfile as sf
+                info = sf.info(str(p))
+                needed_samples = int(len(x) * (info.samplerate / self.target_sr))
+                max_start = max(0, info.frames - needed_samples)
+                start_frame = rng.randint(0, max_start + 1) if max_start > 0 else 0
+                noise_slice, n_sr = sf.read(str(p), start=start_frame, frames=needed_samples)
+                if noise_slice.ndim > 1:
+                    noise_slice = noise_slice[:, 0]
+                if n_sr != self.target_sr:
+                    noise_slice = signal.resample_poly(noise_slice, self.target_sr // 1000, n_sr // 1000)
+                if len(noise_slice) < len(x):
+                    noise_slice = np.pad(noise_slice, (0, len(x) - len(noise_slice)), mode="wrap")
+                else:
+                    noise_slice = noise_slice[:len(x)]
+
+                # Bandpass filter noise to telephone channel
+                noise_slice = apply_bandpass_filter(noise_slice, sample_rate=self.target_sr)
+                sig_p = np.mean(x ** 2) + 1e-12
+                noise_p = np.mean(noise_slice ** 2) + 1e-12
+                target_np = sig_p / (10.0 ** (snr_db / 10.0))
+                scaled = noise_slice * np.sqrt(target_np / noise_p)
+                return (x + scaled).astype(np.float32)
+            except Exception:
+                pass
+        return add_colored_noise(x, snr_db=snr_db, sample_rate=self.target_sr, rng=rng)
 
 
 def apply_speaker_nonlinearity(
@@ -230,6 +371,7 @@ class SynthesisResult:
     clean_references: Dict[str, np.ndarray]  # Pure s_A, s_B without leak or distortion
     scenario: str
     metadata: Dict[str, Any]
+    target_audio: Optional[Dict[str, np.ndarray]] = None
 
 
 class TelephoneDialogueSynthesizer:
@@ -239,9 +381,11 @@ class TelephoneDialogueSynthesizer:
         self,
         config: Optional[SynthesisConfig] = None,
         seed: Optional[int] = None,
+        rir_manager: Optional[RIRManager] = None,
     ):
         self.config = config or SynthesisConfig()
         self.rng = np.random.RandomState(seed)
+        self.rir_manager = rir_manager or RIRManager(target_sr=self.config.sample_rate)
 
     def generate_synthetic_speech_utterance(
         self,
@@ -301,8 +445,8 @@ class TelephoneDialogueSynthesizer:
                 rng=self.rng,
             )
 
-        # 4. Additive noise
-        x = add_colored_noise(x, snr_db=snr_db, sample_rate=self.config.sample_rate, rng=self.rng)
+        # 4. Realistic room/ambient noise
+        x = self.rir_manager.add_realistic_noise(x, snr_db=snr_db, rng=self.rng)
         return x
 
     def synthesize_dialogue(
@@ -349,7 +493,15 @@ class TelephoneDialogueSynthesizer:
         def get_utterance(spk: str, dur: float) -> np.ndarray:
             if utterance_pool and spk in utterance_pool and len(utterance_pool[spk]) > 0:
                 candidates = utterance_pool[spk]
-                utt = candidates[self.rng.randint(len(candidates))]
+                utt = candidates[self.rng.randint(len(candidates))].copy()
+
+                # Speed / pitch perturbation (factor uniform(0.92, 1.08)) to augment vocal tracts
+                if self.rng.rand() < 0.70:
+                    factor = float(self.rng.uniform(0.92, 1.08))
+                    num_resampled = int(round(len(utt) / factor))
+                    if num_resampled > 160:
+                        utt = signal.resample(utt, num_resampled).astype(np.float32)
+
                 target_len = int(sr * dur)
                 if len(utt) >= target_len:
                     return utt[:target_len].copy()
@@ -441,20 +593,21 @@ class TelephoneDialogueSynthesizer:
         clean_s_b = timeline_b.copy()
 
         # 3. Acoustic modeling: RIR convolution
-        # Room response for owner A
-        rir_owner = generate_synthetic_rir(sr, t60_sec=0.18, direct_to_reverberant_ratio_db=15.0, rng=self.rng)
-        rec_a = signal.fftconvolve(timeline_a, rir_owner, mode="same")
-        rec_b = signal.fftconvolve(timeline_b, rir_owner, mode="same")
+        # Room response for owner A & B (high DRR, close-talk mic)
+        rir_owner_a = self.rir_manager.get_owner_rir(rng=self.rng)
+        rir_owner_b = self.rir_manager.get_owner_rir(rng=self.rng)
+        rec_a = signal.fftconvolve(timeline_a, rir_owner_a, mode="same")
+        rec_b = signal.fftconvolve(timeline_b, rir_owner_b, mode="same")
 
-        # Third speaker RIR: more distant and reverberant
-        rir_third = generate_synthetic_rir(sr, t60_sec=0.40, direct_to_reverberant_ratio_db=4.0, rng=self.rng)
+        # Third speaker RIR: more distant and reverberant (real office / conference room)
+        rir_third = self.rir_manager.get_third_speaker_rir(rng=self.rng)
         rec_third = signal.fftconvolve(timeline_3, rir_third, mode="same")
         # Attenuate third speaker relative to owner
         third_gain = 10.0 ** (-self.config.third_speaker_attenuation_db / 20.0)
         rec_third = rec_third * third_gain
 
         # 4. Leakage modeling: Speaker B leaks into Track A (and vice-versa)
-        rir_leak = generate_synthetic_rir(sr, t60_sec=0.22, direct_to_reverberant_ratio_db=8.0, rng=self.rng)
+        rir_leak = self.rir_manager.get_leakage_rir(rng=self.rng)
 
         # Speaker saturation nonlinearity on counterpart signal
         sig_b_speaker = apply_speaker_nonlinearity(rec_b, saturation_factor=1.8)
@@ -531,6 +684,11 @@ class TelephoneDialogueSynthesizer:
             "duration_sec": duration_sec,
         }
 
+        leak_filt_a = apply_bandpass_filter(leak_b_to_a, sample_rate=sr)
+        leak_filt_b = apply_bandpass_filter(leak_a_to_b, sample_rate=sr)
+        target_a = (track_a - leak_filt_a).astype(np.float32)
+        target_b = (track_b - leak_filt_b).astype(np.float32)
+
         return SynthesisResult(
             audio=stereo,
             sample_rate=sr,
@@ -540,4 +698,5 @@ class TelephoneDialogueSynthesizer:
             clean_references={"A": clean_s_a, "B": clean_s_b},
             scenario=scenario,
             metadata=metadata,
+            target_audio={"A": target_a, "B": target_b},
         )

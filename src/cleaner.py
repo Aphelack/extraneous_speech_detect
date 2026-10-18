@@ -1,203 +1,285 @@
-"""Leak suppression and audio cleaning module for two-channel telephone audio.
-
-Implements:
-1. Double-Talk Aware Adaptive NLMS Acoustic Echo Cancellation:
-   Estimates the leakage transfer function h_BA and cancels acoustic coupling.
-2. Post-Filter Spectral Attenuation Mask:
-   Suppresses residual non-linear leak while strictly preserving the phase and
-   spectral energy of the owner's speech during 'own' and 'double_talk' intervals.
-3. Voice embedding similarity evaluation to quantify channel purity improvement.
-"""
+"""Delay-aligned neural spectral cleaner for two-channel telephone audio."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
-from scipy import signal
+import scipy.signal as signal
+from scipy.ndimage import maximum_filter1d, median_filter
+import torch
+import torch.nn as nn
 
-from src.audio_utils import load_stereo_audio, save_stereo_audio
-from src.config import FRAME_DURATION_SEC, FRAME_SAMPLES, SAMPLE_RATE
+from src.audio_utils import load_stereo_audio, resample_audio, save_stereo_audio
+from src.config import FRAME_SAMPLES, SAMPLE_RATE
 from src.detector import ExtraneousSpeechDetector
-from src.metrics import cosine_similarity
+
+
+def create_triangular_filterbank(
+    n_bins: int = 129,
+    num_bands: int = 32,
+    sample_rate: int = SAMPLE_RATE,
+    f_min: float = 100.0,
+    f_max: float = 3800.0,
+) -> np.ndarray:
+    freqs = np.linspace(0.0, sample_rate / 2.0, n_bins)
+    edges = np.linspace(f_min, f_max, num_bands + 2)
+    bank = np.zeros((num_bands, n_bins), dtype=np.float32)
+    for band in range(num_bands):
+        left, center, right = edges[band:band + 3]
+        bank[band] = np.maximum(
+            0.0,
+            np.minimum((freqs - left) / (center - left), (right - freqs) / (right - center)),
+        )
+    bank[0, freqs < f_min] = 1.0
+    bank[-1, freqs > f_max] = 1.0
+    return (bank / (np.sum(bank, axis=0, keepdims=True) + 1e-8)).astype(np.float32)
+
+
+class _CleanerNet(nn.Module):
+    """Small TCN producing a 32-band IRM estimate."""
+
+    def __init__(self, in_channels: int = 164, hidden_dim: int = 48, num_bands: int = 32):
+        super().__init__()
+        self.in_proj = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.GroupNorm(4, hidden_dim),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(hidden_dim, hidden_dim, 3, padding=d, dilation=d),
+                nn.GroupNorm(4, hidden_dim),
+                nn.GELU(),
+            )
+            for d in (1, 2, 4, 8)
+        ])
+        self.head = nn.Sequential(nn.Conv1d(hidden_dim, num_bands, 1), nn.Sigmoid())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        squeezed = x.ndim == 2
+        if squeezed:
+            x = x.unsqueeze(0)
+        hidden = self.in_proj(x)
+        for block in self.blocks:
+            hidden = hidden + block(hidden)
+        output = self.head(hidden)
+        return output.squeeze(0) if squeezed else output
 
 
 @dataclass
 class CleanerConfig:
-    filter_length: int = 256
-    step_size: float = 0.35
-    leak_suppression_db: float = 24.0  # Extra suppression during pure leak
+    weights_path: str = "models/cleaner_weights.pt"
     frame_samples: int = FRAME_SAMPLES
+    n_fft: int = 256
+    num_bands: int = 32
+    delay_min_frames: int = 2
+    delay_max_frames: int = 30
+    delay_smoothing_frames: int = 51
+    noise_percentile: float = 5.0
 
 
 class TelephoneAudioCleaner:
-    """Removes counterpart acoustic leak from stereo recordings."""
+    """Remove counterpart leakage with delay-aligned spectral masking."""
 
-    def __init__(
-        self,
-        config: Optional[CleanerConfig] = None,
-        detector: Optional[ExtraneousSpeechDetector] = None,
-    ):
+    def __init__(self, config: Optional[CleanerConfig] = None, detector: Optional[ExtraneousSpeechDetector] = None):
         self.config = config or CleanerConfig()
         self.detector = detector or ExtraneousSpeechDetector()
+        self.filterbank = create_triangular_filterbank(
+            self.config.n_fft // 2 + 1, self.config.num_bands, SAMPLE_RATE
+        )
+        self._load_model()
 
-    def _nlms_cancel(
+    def _load_model(self) -> None:
+        self.model = None
+        self.mean = None
+        self.std = None
+        path = Path(self.config.weights_path)
+        if not path.exists():
+            path = Path(__file__).resolve().parent.parent / self.config.weights_path
+        if not path.exists():
+            return
+        try:
+            checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
+            state = checkpoint.get("model_state_dict", checkpoint)
+            in_channels = int(checkpoint.get("in_channels", 164)) if isinstance(checkpoint, dict) else 164
+            num_bands = int(checkpoint.get("num_bands", self.config.num_bands)) if isinstance(checkpoint, dict) else self.config.num_bands
+            model = _CleanerNet(in_channels=in_channels, hidden_dim=48, num_bands=num_bands)
+            model.load_state_dict(state)
+            model.eval()
+            self.model = model
+            self.mean = checkpoint.get("mean") if isinstance(checkpoint, dict) else None
+            self.std = checkpoint.get("std") if isinstance(checkpoint, dict) else None
+        except Exception as exc:
+            print(f"Notice: Cleaner weights could not be loaded ({exc}); analytic mask enabled.")
+
+    def estimate_delay_frames(self, mag_a: np.ndarray, mag_b: np.ndarray) -> np.ndarray:
+        """Estimate local envelope delay and smooth it over 50 frames."""
+        env_a = np.log(np.mean(mag_a ** 2, axis=0) + 1e-8)
+        env_b = np.log(np.mean(mag_b ** 2, axis=0) + 1e-8)
+        frames = len(env_a)
+        half_window = 10
+
+        def rolling_mean(values: np.ndarray) -> np.ndarray:
+            return signal.convolve(values, np.ones(2 * half_window + 1) / (2 * half_window + 1), mode="same")
+
+        mean_a = rolling_mean(env_a)
+        centered_a = env_a - mean_a
+        scores = np.full((self.config.delay_max_frames - self.config.delay_min_frames + 1, frames), -1.0, dtype=np.float32)
+        for row, delay in enumerate(range(self.config.delay_min_frames, self.config.delay_max_frames + 1)):
+            shifted_b = np.zeros(frames, dtype=np.float32)
+            if delay < frames:
+                shifted_b[delay:] = env_b[:-delay]
+            mean_b = rolling_mean(shifted_b)
+            centered_b = shifted_b - mean_b
+            numerator = rolling_mean(centered_a * centered_b)
+            denom = np.sqrt(rolling_mean(centered_a ** 2) * rolling_mean(centered_b ** 2)) + 1e-8
+            scores[row] = numerator / denom
+        delays = np.argmax(scores, axis=0) + self.config.delay_min_frames
+        return np.clip(
+            median_filter(delays, size=self.config.delay_smoothing_frames, mode="nearest"),
+            self.config.delay_min_frames,
+            self.config.delay_max_frames,
+        ).astype(np.int32)
+
+    def align_spectrum(self, spectrum_b: np.ndarray, delays: np.ndarray) -> np.ndarray:
+        frames = spectrum_b.shape[1]
+        indices = np.maximum(np.arange(frames) - delays.astype(np.int32), 0)
+        return spectrum_b[:, indices]
+
+    def _estimate_leakage(self, mag_a: np.ndarray, aligned_b: np.ndarray, p_own: np.ndarray, p_leak: np.ndarray) -> np.ndarray:
+        bins, frames = mag_a.shape
+        coefficient = np.full(bins, 0.2, dtype=np.float32)
+        estimate = np.zeros_like(mag_a, dtype=np.float32)
+        for t in range(frames):
+            if p_leak[t] > 0.5 and p_own[t] < 0.2:
+                ratio = mag_a[:, t] / (aligned_b[:, t] + 1e-6)
+                coefficient = 0.95 * coefficient + 0.05 * ratio
+            estimate[:, t] = coefficient * aligned_b[:, t]
+        return estimate
+
+    def extract_features(
         self,
-        target: np.ndarray,
-        reference: np.ndarray,
-        freeze_mask: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """Run double-talk aware NLMS echo canceller.
-
-        Freezes weight adaptation when freeze_mask is True (e.g. during own speech).
-        """
-        n = min(len(target), len(reference))
-        L = self.config.filter_length
-        mu = self.config.step_size
-        eps = 1e-5
-
-        if n < L:
-            return target.copy()
-
-        error = np.zeros(n, dtype=np.float32)
-        w = np.zeros(L, dtype=np.float32)
-
-        ref_padded = np.pad(reference[:n], (L - 1, 0), mode="constant")
-        from numpy.lib.stride_tricks import sliding_window_view
-
-        windows = sliding_window_view(ref_padded, window_shape=L)
-
-        # Block updates (block size 80 = 10 ms)
-        hop = 80
-        for b in range(0, n, hop):
-            end_b = min(n, b + hop)
-            x_blk = windows[b:end_b]
-            y_hat = x_blk @ w
-            e_blk = target[b:end_b] - y_hat
-            error[b:end_b] = e_blk
-
-            # Check if adaptation should occur (not frozen by double talk / own speech)
-            is_frozen = False
-            if freeze_mask is not None and b < len(freeze_mask):
-                is_frozen = bool(freeze_mask[b])
-
-            if not is_frozen:
-                power = np.sum(x_blk ** 2) + eps
-                grad = np.sum(x_blk * e_blk[:, None], axis=0)
-                w += (mu / power) * grad
-
-        return error
-
-    def _apply_spectral_attenuation(
-        self,
-        audio_channel: np.ndarray,
-        prob_leak: np.ndarray,
+        Za: np.ndarray,
+        Zb: np.ndarray,
         prob_own: np.ndarray,
-        frame_samples: int = FRAME_SAMPLES,
+        prob_leak: np.ndarray,
+        prob_third: np.ndarray,
+        aligned_b: Optional[np.ndarray] = None,
+        leak_estimate: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Apply soft spectral attenuation to suppress residual non-linear leak."""
-        num_frames = min(len(prob_leak), len(prob_own))
-        total_len = min(len(audio_channel), num_frames * frame_samples)
-        if total_len == 0:
-            return audio_channel.copy()
+        mag_a = np.abs(Za)
+        if aligned_b is None:
+            aligned_b = Zb
+        mag_b = np.abs(aligned_b)
+        if leak_estimate is None:
+            leak_estimate = np.zeros_like(mag_a)
+        W = self.filterbank
+        log_a = np.log(W @ mag_a + 1e-6)
+        log_b = np.log(W @ mag_b + 1e-6)
+        log_leak = np.log(W @ leak_estimate + 1e-6)
+        log_ratio = np.log((W @ mag_a + 1e-6) / (W @ leak_estimate + 1e-6))
+        prev_b = np.concatenate([log_b[:, :1], log_b[:, :-1]], axis=1)
+        next_b = np.concatenate([log_b[:, 1:], log_b[:, -1:]], axis=1)
+        power_a = np.sum(mag_a ** 2, axis=0) + 1e-8
+        power_b = np.sum(mag_b ** 2, axis=0) + 1e-8
+        ild = (10.0 * np.log10(power_a / power_b) / 20.0).clip(-2.0, 2.0)
+        frames = mag_a.shape[1]
+        probs = np.zeros((3, frames), dtype=np.float32)
+        for row, values in enumerate((prob_own, prob_leak, prob_third)):
+            length = min(frames, len(values))
+            if length:
+                probs[row, :length] = values[:length]
+                probs[row, length:] = values[length - 1]
+        return np.vstack([log_a, log_b, prev_b, next_b, log_leak, log_ratio, probs, ild[None, :]]).astype(np.float32)
 
-        # Build frame gains
-        # If pure leak: gain = 10^(-suppression / 20)
-        # If own: gain = 1.0 (protect speech)
-        min_gain = 10.0 ** (-self.config.leak_suppression_db / 20.0)
-        leak_factor = np.clip(prob_leak[:num_frames] - prob_own[:num_frames], 0.0, 1.0)
-        frame_gains = 1.0 - leak_factor * (1.0 - min_gain)
+    def _apply_cleaner_mask(self, target_audio: np.ndarray, counterpart_audio: np.ndarray, prob_own: np.ndarray, prob_leak: np.ndarray, prob_third: np.ndarray, sample_rate: int = SAMPLE_RATE) -> Tuple[np.ndarray, np.ndarray]:
+        n_samples = min(len(target_audio), len(counterpart_audio))
+        n_fft = self.config.n_fft
+        hop = self.config.frame_samples
+        window = signal.windows.hann(n_fft)
+        _, _, Za = signal.stft(target_audio[:n_samples], fs=sample_rate, window=window, nperseg=n_fft, noverlap=n_fft - hop)
+        _, _, Zb = signal.stft(counterpart_audio[:n_samples], fs=sample_rate, window=window, nperseg=n_fft, noverlap=n_fft - hop)
+        mag_a, mag_b = np.abs(Za), np.abs(Zb)
+        delays = self.estimate_delay_frames(mag_a, mag_b)
+        aligned_b = self.align_spectrum(Zb, delays)
+        frames = mag_a.shape[1]
+        p_own = np.resize(np.asarray(prob_own, dtype=np.float32), frames)
+        p_leak = np.resize(np.asarray(prob_leak, dtype=np.float32), frames)
+        p_third = np.resize(np.asarray(prob_third, dtype=np.float32), frames)
+        leak_estimate = self._estimate_leakage(mag_a, np.abs(aligned_b), p_own, p_leak)
+        features = self.extract_features(Za, Zb, p_own, p_leak, p_third, aligned_b, leak_estimate)
+        if self.model is not None and self.model.in_proj[0].in_channels == features.shape[0]:
+            model_features = features
+            if self.mean is not None and self.std is not None:
+                model_features = (model_features - np.asarray(self.mean)) / (np.asarray(self.std) + 1e-6)
+            with torch.no_grad():
+                bands = self.model(torch.tensor(model_features, dtype=torch.float32)).numpy()
+        else:
+            band_a = self.filterbank @ mag_a
+            band_leak = self.filterbank @ leak_estimate
+            bands = 1.0 / np.sqrt(1.0 + band_leak / (band_a + 1e-6))
 
-        # Smooth frame gains over time to prevent musical noise
-        frame_gains = signal.medfilt(frame_gains, kernel_size=5)
+        neural_gain = np.clip(self.filterbank.T @ bands, 0.0, 1.0)
+        analytic_gain = np.sqrt(
+            np.maximum(mag_a ** 2 - 1.3 * leak_estimate ** 2, 0.0)
+            / (mag_a ** 2 + 1e-8)
+        )
+        analytic_gain = np.clip(analytic_gain, 0.30, 1.0)
+        double_talk_gain = np.clip(0.5 * neural_gain + 0.5 * analytic_gain, 0.30, 1.0)
+        noise_floor = np.percentile(mag_a, self.config.noise_percentile, axis=1, keepdims=True)
+        leak_ext = maximum_filter1d(p_leak, size=20, mode="nearest", origin=-9)
+        pure_own = leak_ext < 0.20
+        pure_leak = (p_own < 0.22) & (leak_ext >= 0.30)
+        double_talk = (p_own >= 0.22) & (leak_ext >= 0.20)
 
-        # Interpolate frame gains to sample level
-        sample_gains = np.repeat(frame_gains, frame_samples)[:total_len]
-        cleaned = audio_channel[:total_len] * sample_gains
+        gain = np.ones_like(mag_a, dtype=np.float32)
+        gain[:, double_talk] = double_talk_gain[:, double_talk]
+        gain[:, pure_leak] = np.clip(
+            noise_floor / (mag_a[:, pure_leak] + 1e-8),
+            0.015,
+            0.05,
+        )
+        gain = np.clip(gain, 0.0, 1.0)
+        cleaned_mag = np.maximum(mag_a * gain, noise_floor)
+        cleaned_spec = Za * (cleaned_mag / (mag_a + 1e-8))
+        if np.any(pure_leak):
+            rng = np.random.RandomState(42)
+            phase = rng.uniform(-np.pi, np.pi, size=Za.shape)
+            comfort = 0.15 * noise_floor * np.exp(1j * phase)
+            cleaned_spec[:, pure_leak] += comfort[:, :1]
+        _, cleaned = signal.istft(cleaned_spec, fs=sample_rate, window=window, nperseg=n_fft, noverlap=n_fft - hop)
+        return cleaned[:n_samples].astype(np.float32), gain.astype(np.float32)
 
-        # Pad back to original length if needed
-        if len(audio_channel) > total_len:
-            cleaned = np.pad(cleaned, (0, len(audio_channel) - total_len), mode="constant")
-
-        return cleaned.astype(np.float32)
-
-    def clean_stereo(
-        self,
-        audio: np.ndarray,
-        sample_rate: int = SAMPLE_RATE,
-    ) -> np.ndarray:
-        """Clean both tracks of a stereo recording.
-
-        Parameters
-        ----------
-        audio : np.ndarray
-            Shape (2, num_samples): [0] is Track A, [1] is Track B.
-
-        Returns
-        -------
-        cleaned_stereo : np.ndarray of shape (2, num_samples)
-        """
+    def clean_stereo(self, audio: np.ndarray, sample_rate: int = SAMPLE_RATE, return_masks: bool = False) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, np.ndarray]]]:
         if audio.ndim != 2 or audio.shape[0] != 2:
             raise ValueError(f"Expected shape (2, N), got {audio.shape}")
-
         probs = self.detector.predict_probabilities(audio, sample_rate=sample_rate)
-        probs_a = probs["A"]
-        probs_b = probs["B"]
+        clean_a, mask_a = self._apply_cleaner_mask(audio[0], audio[1], probs["A"]["own"], probs["A"]["leak"], probs["A"]["third"], sample_rate)
+        clean_b, mask_b = self._apply_cleaner_mask(audio[1], audio[0], probs["B"]["own"], probs["B"]["leak"], probs["B"]["third"], sample_rate)
+        cleaned = np.stack([clean_a, clean_b]).astype(np.float32)
+        return (cleaned, {"A": mask_a, "B": mask_b}) if return_masks else cleaned
 
-        # Freeze adaptation when local speaker is talking
-        hop = self.config.frame_samples
-        freeze_mask_a = np.repeat(probs_a["own"] > 0.4, hop)
-        freeze_mask_b = np.repeat(probs_b["own"] > 0.4, hop)
-
-        # 1. NLMS linear echo cancellation
-        nlms_a = self._nlms_cancel(target=audio[0], reference=audio[1], freeze_mask=freeze_mask_a)
-        nlms_b = self._nlms_cancel(target=audio[1], reference=audio[0], freeze_mask=freeze_mask_b)
-
-        # 2. Residual non-linear leak suppression
-        clean_a = self._apply_spectral_attenuation(
-            audio_channel=nlms_a,
-            prob_leak=probs_a["leak"],
-            prob_own=probs_a["own"],
-            frame_samples=hop,
-        )
-        clean_b = self._apply_spectral_attenuation(
-            audio_channel=nlms_b,
-            prob_leak=probs_b["leak"],
-            prob_own=probs_b["own"],
-            frame_samples=hop,
-        )
-
-        return np.stack([clean_a, clean_b], axis=0).astype(np.float32)
-
-    def clean_wav(self, input_wav: str, output_wav: str) -> None:
-        """CLI helper: read input stereo WAV, clean leak, write clean stereo WAV."""
+    def clean_wav(self, input_wav: str, output_wav: str, preview_wav: Optional[str] = None, preview_sr: int = 16000) -> None:
         audio, sr = load_stereo_audio(input_wav, target_sr=SAMPLE_RATE)
         cleaned = self.clean_stereo(audio, sample_rate=sr)
         save_stereo_audio(output_wav, cleaned, sample_rate=sr)
+        if preview_wav:
+            save_stereo_audio(preview_wav, resample_audio(cleaned, orig_sr=sr, target_sr=preview_sr), sample_rate=preview_sr)
+
+    def clean(self, audio: np.ndarray, predictions: Optional[Any] = None, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+        return self.clean_stereo(audio, sample_rate=sample_rate)
 
 
 def compute_spectral_embedding(signal_1d: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-    """Compute normalized 32-band filterbank spectral embedding vector for speech verification."""
     if len(signal_1d) < 256:
         return np.zeros(32, dtype=np.float32)
-
-    # Compute power spectrum
-    n_fft = 512
-    freqs, times, stft_mat = signal.stft(signal_1d, fs=sample_rate, nperseg=256, noverlap=128, nfft=n_fft)
-    power = np.abs(stft_mat) ** 2  # (freq_bins, frames)
-
-    # Triangular mel/subband filters in 300 - 3400 Hz range
-    num_filters = 32
-    f_min, f_max = 300.0, 3400.0
-    filter_edges = np.linspace(f_min, f_max, num_filters + 2)
-    bank_energies = []
-
-    for k in range(num_filters):
-        left, center, right = filter_edges[k], filter_edges[k + 1], filter_edges[k + 2]
-        filt = np.maximum(0.0, 1.0 - np.abs(freqs - center) / (center - left))
-        filt_energy = np.mean(filt[:, None] * power)
-        bank_energies.append(filt_energy)
-
-    vec = np.log10(np.maximum(np.array(bank_energies), 1e-10))
-    norm = np.linalg.norm(vec) + 1e-10
-    return (vec / norm).astype(np.float32)
-
+    freqs, _, stft_mat = signal.stft(signal_1d, fs=sample_rate, nperseg=256, noverlap=128, nfft=512)
+    power = np.abs(stft_mat) ** 2
+    edges = np.linspace(300.0, 3400.0, 34)
+    energies = []
+    for left, center, right in zip(edges[:-2], edges[1:-1], edges[2:]):
+        filt = np.maximum(0.0, np.minimum((freqs - left) / (center - left), (right - freqs) / (right - center)))
+        energies.append(np.mean(filt[:, None] * power))
+    vector = np.log10(np.maximum(energies, 1e-10))
+    return (vector / (np.linalg.norm(vector) + 1e-10)).astype(np.float32)

@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.ndimage import median_filter
+from scipy.ndimage import binary_closing, median_filter
 
 from src.audio_utils import load_stereo_audio
 from src.config import (
@@ -31,21 +31,65 @@ from src.features import FeatureExtractor
 from src.metrics import frame_mask_to_intervals
 
 
-class _DetectorNet(nn.Module):
-    """Compact multi-label feedforward network."""
-
-    def __init__(self, in_features: int = 9, hidden_dim: int = 32, num_classes: int = 3):
+class ResidualDilatedConvBlock(nn.Module):
+    def __init__(self, channels: int = 48, kernel_size: int = 5, dilation: int = 1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_features, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, num_classes),
-        )
+        pad = (dilation * (kernel_size - 1)) // 2
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=pad, dilation=dilation)
+        self.norm1 = nn.GroupNorm(4, channels)
+        self.act1 = nn.GELU()
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=1)
+        self.norm2 = nn.GroupNorm(4, channels)
+        self.act2 = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        res = x
+        y = self.act1(self.norm1(self.conv1(x)))
+        y = self.norm2(self.conv2(y))
+        return self.act2(y + res)
+
+
+class _DetectorNet(nn.Module):
+    """Contextual 1D-TCN (Dilated Conv1d) multi-label detector.
+
+    4 residual blocks with dilations [1, 2, 4, 8], receptive field ~60 frames (600 ms).
+    Strictly satisfies single-core CPU RTF <= 0.001 and lookahead <= 1 s.
+    """
+
+    def __init__(self, in_features: int = 36, hidden_dim: int = 48, num_classes: int = 3):
+        super().__init__()
+        self.in_features = in_features
+        self.in_proj = nn.Sequential(
+            nn.Conv1d(in_features, hidden_dim, kernel_size=1),
+            nn.GroupNorm(4, hidden_dim),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList([
+            ResidualDilatedConvBlock(hidden_dim, kernel_size=5, dilation=d)
+            for d in [1, 2, 4, 8]
+        ])
+        self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Accepts (B, C, T) or (T, C)
+        squeeze_batch = False
+        if x.ndim == 2:
+            # (T, C) -> (1, C, T)
+            x = x.transpose(0, 1).unsqueeze(0)
+            squeeze_batch = True
+        elif x.ndim == 3 and x.shape[1] != self.in_features and x.shape[2] == self.in_features:
+            # (B, T, C) -> (B, C, T)
+            x = x.transpose(1, 2)
+
+        h = self.in_proj(x)
+        for blk in self.blocks:
+            h = blk(h)
+        logits = self.head(h)  # (B, num_classes, T)
+
+        if squeeze_batch:
+            # (1, num_classes, T) -> (T, num_classes)
+            return logits.squeeze(0).transpose(0, 1)
+        return logits
 
 
 @dataclass
@@ -54,9 +98,10 @@ class DetectorConfig:
     frame_sec: float = FRAME_DURATION_SEC
     threshold_own: float = 0.50
     threshold_leak: float = 0.50
-    threshold_third: float = 0.65
+    threshold_third: float = 0.52
     smoothing_window_frames: int = 5  # 50 ms temporal smoothing
     min_segment_sec: float = 0.08     # 80 ms minimum duration
+    min_segment_third_sec: float = 0.22  # 220 ms minimum duration for third
     vad_energy_threshold_db: float = -48.0
 
 
@@ -94,7 +139,7 @@ class ExtraneousSpeechDetector:
             try:
                 ckpt = torch.load(weights_file, map_location="cpu", weights_only=False)
                 in_dim = len(ckpt["mean"].flatten())
-                model = _DetectorNet(in_features=in_dim, hidden_dim=32, num_classes=3)
+                model = _DetectorNet(in_features=in_dim, hidden_dim=48, num_classes=3)
                 model.load_state_dict(ckpt["model_state_dict"])
                 model.eval()
                 self.model = model
@@ -140,11 +185,11 @@ class ExtraneousSpeechDetector:
                 continue
 
             db_energy = ch_feats[:, 0]
+            ild = ch_feats[:, 1]
+            gcc_peak = ch_feats[:, 3]
+            anchor_cos_dist = ch_feats[:, 33]
             vad_mask = self._estimate_vad_mask(db_energy)
-
-            # Combine local features + counterpart energy
-            other_energy = other_feats[:, 0:1]
-            x_full = np.hstack([ch_feats, other_energy])
+            x_full = ch_feats
 
             if self.model is not None:
                 # Standardize
@@ -158,19 +203,28 @@ class ExtraneousSpeechDetector:
                 p_leak = preds[:, 1]
                 p_third = preds[:, 2]
 
-                # Mask out frames during silence
-                p_own = np.where(vad_mask, p_own, 0.0)
-                p_leak = np.where(vad_mask, p_leak, 0.0)
-                # Third speaker is mutually exclusive with confident owner speech
-                p_third = np.where(vad_mask & (p_own < 0.6), p_third, 0.0)
+                # Absolute silence is the only post-network physical constraint.
+                silence_floor = db_energy < -60.0
+                p_own = np.where(silence_floor, 0.0, p_own)
+                p_leak = np.where(silence_floor, 0.0, p_leak)
+                p_third = np.where(silence_floor, 0.0, p_third)
             else:
                 # Calibrated physical heuristic fallback
-                ild = ch_feats[:, 1]
                 other_vad = self._estimate_vad_mask(other_feats[:, 0])
 
                 p_leak = np.where(vad_mask & other_vad & (ild < 7.0), 0.85, 0.0)
                 p_own = np.where(vad_mask & (ild > -7.0), 0.90, 0.0)
-                p_third = np.where(vad_mask & (~other_vad) & (ch_feats[:, 6] < 0.65), 0.85, 0.0)
+                p_third = np.where(
+                    vad_mask & (~other_vad) & (ch_feats[:, 6] < 0.65) & (anchor_cos_dist > 0.35),
+                    0.85,
+                    0.0,
+                )
+
+            # A third speaker is local to this channel: cross-channel evidence
+            # or a close owner-anchor match is incompatible with that label.
+            third_is_remote = (p_leak > 0.45) | (gcc_peak > 0.35) | (ild < -3.0)
+            third_is_owner = (ild > 6.0) & (anchor_cos_dist < 0.32)
+            p_third = np.where(third_is_remote | third_is_owner, 0.0, p_third)
 
             # Temporal median filtering (50 ms)
             k = self.config.smoothing_window_frames
@@ -226,14 +280,23 @@ class ExtraneousSpeechDetector:
 
             # 3. Third speaker intervals
             mask_third = ch_probs[LABEL_THIRD] >= self.config.threshold_third
+            if len(mask_third) > 7:
+                mask_third = binary_closing(mask_third, structure=np.ones(7, dtype=bool))
+            min_dur_third = getattr(self.config, "min_segment_third_sec", 0.22)
+            third_intervals = frame_mask_to_intervals(
+                mask_third,
+                label=LABEL_THIRD,
+                frame_sec=self.config.frame_sec,
+                scores=ch_probs[LABEL_THIRD],
+                min_duration_sec=min_dur_third,
+            )
             intervals_ch.extend(
-                frame_mask_to_intervals(
-                    mask_third,
-                    label=LABEL_THIRD,
-                    frame_sec=self.config.frame_sec,
-                    scores=ch_probs[LABEL_THIRD],
-                    min_duration_sec=self.config.min_segment_sec,
-                )
+                item
+                for item in third_intervals
+                if float(np.max(ch_probs[LABEL_THIRD][
+                    int(item["start"] / self.config.frame_sec):
+                    int(item["end"] / self.config.frame_sec)
+                ])) >= 0.65
             )
 
             intervals_ch.sort(key=lambda x: x["start"])
@@ -245,3 +308,6 @@ class ExtraneousSpeechDetector:
         """Load stereo WAV file and produce predictions."""
         audio, sr = load_stereo_audio(wav_path, target_sr=SAMPLE_RATE)
         return self.predict_intervals(audio, sample_rate=sr)
+
+    # Standard alias matching cleaner/baseline interface
+    detect = predict_intervals

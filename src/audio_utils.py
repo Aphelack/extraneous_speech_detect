@@ -87,6 +87,132 @@ def save_stereo_audio(
         wavfile.write(wav_path, sample_rate, int16_data)
 
 
+def resample_audio(
+    audio: np.ndarray,
+    orig_sr: int = SAMPLE_RATE,
+    target_sr: int = 16000,
+) -> np.ndarray:
+    """Resample 1D or 2D audio array between sample rates.
+
+    Uses polyphase filtering (`scipy.signal.resample_poly`), which preserves
+    pitch and exact frequency content without introducing spectral artifacts.
+
+    Parameters
+    ----------
+    audio : np.ndarray
+        Shape (N,) for 1D mono, or (2, N) / (N, 2) for stereo.
+    orig_sr : int
+        Original sample rate (e.g. 8000).
+    target_sr : int
+        Target sample rate (e.g. 16000 for browser/VS Code compatibility).
+
+    Returns
+    -------
+    resampled : np.ndarray (float32)
+    """
+    if orig_sr == target_sr:
+        return audio.astype(np.float32)
+
+    import math
+    from scipy import signal
+
+    g = math.gcd(int(orig_sr), int(target_sr))
+    up = int(target_sr // g)
+    down = int(orig_sr // g)
+
+    if audio.ndim == 1:
+        return signal.resample_poly(audio, up, down).astype(np.float32)
+    elif audio.ndim == 2:
+        # Determine channel axis: (2, N) vs (N, 2)
+        axis = 1 if audio.shape[0] <= 2 and audio.shape[1] > audio.shape[0] else 0
+        return signal.resample_poly(audio, up, down, axis=axis).astype(np.float32)
+    else:
+        return signal.resample_poly(audio, up, down).astype(np.float32)
+
+
+def play_sound(
+    audio: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    blocking: bool = True,
+) -> bool:
+    """Play audio directly through Ubuntu speakers via ALSA aplay.
+
+    This completely bypasses VS Code's Electron/Snap sandbox where audio output
+    is frequently broken or muted on Linux/PipeWire.
+
+    Parameters
+    ----------
+    audio : np.ndarray
+        1D or 2D audio array.
+    sample_rate : int
+        Sample rate in Hz (default 8000).
+    blocking : bool
+        If True, waits for playback to finish before returning.
+
+    Returns
+    -------
+    success : bool
+    """
+    import shutil
+    import subprocess
+
+    aplay_path = shutil.which("aplay")
+    if not aplay_path:
+        return False
+
+    clipped = np.clip(audio, -1.0, 1.0)
+    int16_data = (clipped * 32767.0).astype(np.int16)
+    channels = 1 if audio.ndim == 1 else audio.shape[0]
+
+    try:
+        proc = subprocess.Popen(
+            [aplay_path, "-q", "-r", str(sample_rate), "-f", "S16_LE", "-c", str(channels)],
+            stdin=subprocess.PIPE,
+        )
+        if blocking:
+            proc.communicate(input=int16_data.tobytes())
+        else:
+            proc.stdin.write(int16_data.tobytes())
+            proc.stdin.close()
+        return True
+    except Exception:
+        return False
+
+
+def play_audio(
+    audio: np.ndarray,
+    orig_sr: int = SAMPLE_RATE,
+    target_sr: int = 16000,
+    play_system: bool = False,
+):
+    """Create an IPython Audio widget with safe resampling for web browsers.
+
+    Parameters
+    ----------
+    audio : np.ndarray
+        1D or 2D audio array.
+    orig_sr : int, default 8000
+        Original sample rate of `audio`.
+    target_sr : int, default 16000
+        Playback sample rate compatible with web browsers.
+    play_system : bool, default False
+        If True, simultaneously plays the audio directly through Ubuntu's
+        system speakers via ALSA `aplay`, bypassing VS Code's sandboxed
+        audio stack.
+
+    Returns
+    -------
+    IPython.display.Audio
+    """
+    if play_system:
+        play_sound(audio, sample_rate=orig_sr, blocking=True)
+
+    from IPython.display import Audio
+
+    resampled = resample_audio(audio, orig_sr=orig_sr, target_sr=target_sr)
+    return Audio(resampled, rate=target_sr)
+
+
 def compute_frame_energies_db(
     signal: np.ndarray,
     frame_samples: int = FRAME_SAMPLES,

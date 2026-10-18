@@ -138,6 +138,79 @@ def compute_gcc_phat_peak(
     return peak_val, delay_sec
 
 
+def get_mel_filterbank(
+    sr: int = SAMPLE_RATE,
+    n_fft: int = 256,
+    n_mels: int = 12,
+    fmin: float = 300.0,
+    fmax: float = 3400.0,
+) -> np.ndarray:
+    """Construct triangular Mel filterbank matrix in telephone band (300 - 3400 Hz)."""
+    def hz_to_mel(hz):
+        return 2595.0 * np.log10(1.0 + hz / 700.0)
+
+    def mel_to_hz(mel):
+        return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+    mel_min = hz_to_mel(fmin)
+    mel_max = hz_to_mel(fmax)
+    mels = np.linspace(mel_min, mel_max, n_mels + 2)
+    hz = mel_to_hz(mels)
+    bins = np.floor((n_fft + 1) * hz / sr).astype(int)
+    fb = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
+    for i in range(n_mels):
+        left, center, right = bins[i], bins[i + 1], bins[i + 2]
+        for b in range(left, center):
+            fb[i, b] = (b - left) / max(1, center - left)
+        for b in range(center, right):
+            fb[i, b] = (right - b) / max(1, right - center)
+    return fb
+
+
+def extract_speaker_anchor_features(
+    mel_matrix: np.ndarray,
+    ild: np.ndarray,
+    gcc_peak: np.ndarray,
+    db_energy: np.ndarray,
+) -> np.ndarray:
+    """Extract speaker anchor similarity features to discriminate distant third speaker.
+
+    1. Finds confident owner frames where ILD > 10 dB and GCC peak < 0.25 (min 20 frames,
+       else falls back to top 15% loudest frames with positive ILD).
+    2. Computes mean log-mel vector mu_own.
+    3. Returns:
+       - cosine distance: 1 - cos_sim(mel(t), mu_own)
+       - L1 deviation in low-frequency bands (0..6)
+       - L1 deviation in high-frequency bands (6..12)
+    """
+    clean_mask = (ild > 10.0) & (gcc_peak < 0.25) & (db_energy > -45.0)
+    if np.sum(clean_mask) < 20:
+        pos_mask = ild > 0.0
+        if np.sum(pos_mask) >= 10:
+            threshold = np.percentile(db_energy[pos_mask], 85)
+            clean_mask = pos_mask & (db_energy >= threshold)
+        else:
+            clean_mask = np.ones(len(mel_matrix), dtype=bool)
+
+    if np.sum(clean_mask) > 0:
+        mu_own = np.mean(mel_matrix[clean_mask], axis=0)
+    else:
+        mu_own = np.mean(mel_matrix, axis=0)
+
+    # Cosine distance
+    norm_mel = np.linalg.norm(mel_matrix, axis=1, keepdims=True) + 1e-8
+    norm_mu = np.linalg.norm(mu_own) + 1e-8
+    cos_sim = (mel_matrix @ mu_own) / (norm_mel.squeeze() * norm_mu)
+    cos_dist = np.clip(1.0 - cos_sim, 0.0, 2.0)[:, None]
+
+    # L1 deviations (low band vs high band)
+    l1_diff = np.abs(mel_matrix - mu_own)
+    l1_low = np.mean(l1_diff[:, :6], axis=1, keepdims=True)
+    l1_high = np.mean(l1_diff[:, 6:], axis=1, keepdims=True)
+
+    return np.hstack([cos_dist, l1_low, l1_high]).astype(np.float32)
+
+
 class FeatureExtractor:
     """Extracts aligned multi-feature frame matrix for Track A and Track B."""
 
@@ -150,6 +223,7 @@ class FeatureExtractor:
         self.sample_rate = sample_rate
         self.frame_sec = frame_sec
         self.frame_samples = frame_samples
+        self.mel_fb = get_mel_filterbank(sr=sample_rate, n_fft=256, n_mels=12)
 
     def extract_features(
         self,
@@ -261,6 +335,14 @@ class FeatureExtractor:
                 gcc_peaks_b[f:end_f] = pk_b
                 gcc_delays_b[f:end_f] = d_b
 
+        # 12 Log-Mel band energies for channel A and channel B (300 - 3400 Hz)
+        mel_a = np.log(np.maximum(spec_a @ self.mel_fb.T, 1e-6))
+        mel_b = np.log(np.maximum(spec_b @ self.mel_fb.T, 1e-6))
+
+        # Speaker anchor similarity features for third speaker discrimination
+        anchor_a = extract_speaker_anchor_features(mel_a, ild_a, gcc_peaks_a, db_a)
+        anchor_b = extract_speaker_anchor_features(mel_b, ild_b, gcc_peaks_b, db_b)
+
         feature_names = [
             "db_energy",
             "ild",
@@ -270,6 +352,11 @@ class FeatureExtractor:
             "centroid",
             "hl_ratio",
             "flatness",
+            "counterpart_energy",
+        ] + [f"local_mel_{i}" for i in range(12)] + [f"other_mel_{i}" for i in range(12)] + [
+            "anchor_cos_dist",
+            "anchor_l1_low",
+            "anchor_l1_high",
         ]
 
         feats_a = np.column_stack([
@@ -281,6 +368,10 @@ class FeatureExtractor:
             centroid_a,
             hl_ratio_a,
             flatness_a,
+            db_b,
+            mel_a,
+            mel_b,
+            anchor_a,
         ]).astype(np.float32)
 
         feats_b = np.column_stack([
@@ -292,6 +383,10 @@ class FeatureExtractor:
             centroid_b,
             hl_ratio_b,
             flatness_b,
+            db_a,
+            mel_b,
+            mel_a,
+            anchor_b,
         ]).astype(np.float32)
 
         return {

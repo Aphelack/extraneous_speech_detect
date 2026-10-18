@@ -88,3 +88,26 @@ def test_cleaner_reduces_leak_and_preserves_voice():
 
     assert sim_cleaned >= sim_noisy - 0.02, "Cleaning must not degrade voice representation of owner!"
 
+
+def test_resample_audio_and_playback():
+    """Verify resample_audio and play_audio work properly for 1D and 2D arrays."""
+    from src.audio_utils import play_audio, resample_audio
+
+    # 1D audio
+    mono = np.random.randn(8000).astype(np.float32) * 0.1
+    mono_16k = resample_audio(mono, orig_sr=8000, target_sr=16000)
+    assert mono_16k.shape == (16000,)
+    assert not np.any(np.isnan(mono_16k))
+
+    # 2D stereo (2, 8000)
+    stereo = np.random.randn(2, 8000).astype(np.float32) * 0.1
+    stereo_16k = resample_audio(stereo, orig_sr=8000, target_sr=16000)
+    assert stereo_16k.shape == (2, 16000)
+
+    # play_audio returns valid IPython Audio object
+    widget = play_audio(mono, orig_sr=8000, target_sr=16000)
+    assert widget is not None
+    html = widget._repr_html_()
+    assert "audio" in html and "controls" in html
+
+

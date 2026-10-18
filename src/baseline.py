@@ -195,6 +195,9 @@ class EnergyBaselineDetector:
         audio, sr = load_stereo_audio(wav_path, target_sr=SAMPLE_RATE)
         return self.predict_intervals(audio, sample_rate=sr)
 
+    # Standard alias matching ExtraneousSpeechDetector interface
+    detect = predict_intervals
+
 
 def predict_baseline_rule(
     audio: np.ndarray,
