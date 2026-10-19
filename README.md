@@ -76,7 +76,7 @@ data/russian_speech/
 Для другого корпуса укажите его путь:
 
 ```bash
-python evaluate.py --dataset-path /path/to/dataset --num_per_scenario 3
+python evaluate.py --dataset-path /path/to/dataset --num_per_scenario 30
 ```
 
 Для подготовленного корпуса из пар `input.wav` и `ground_truth.json` можно обработать все записи без случайной генерации новых диалогов:
