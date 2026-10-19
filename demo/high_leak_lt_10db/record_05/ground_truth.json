@@ -1,0 +1,36 @@
+{
+  "A": [
+    {
+      "start": 0.5,
+      "end": 2.98,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 3.2374,
+      "end": 4.5315,
+      "label": "third",
+      "score": 1.0
+    },
+    {
+      "start": 3.9033,
+      "end": 6.1585,
+      "label": "leak",
+      "score": 1.0
+    }
+  ],
+  "B": [
+    {
+      "start": 0.54,
+      "end": 3.02,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 3.6255,
+      "end": 5.8807,
+      "label": "own",
+      "score": 1.0
+    }
+  ]
+}

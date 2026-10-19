@@ -44,8 +44,65 @@ python scripts/train_cleaner.py
 
 ```bash
 pytest tests/
-python evaluate.py --num_per_scenario 3 --duration_sec 7.0 --seed 42
+python evaluate.py --dataset-path data/russian_speech --num_per_scenario 10 --duration_sec 7.0 --seed 42
 ```
+
+`evaluate.py` принимает путь к корпусу с папками дикторов. В каждой папке должны находиться WAV-файлы одного диктора:
+
+```text
+dataset/
+├── speaker_01/
+│   ├── utterance_001.wav
+│   └── utterance_002.wav
+├── speaker_02/
+│   └── utterance_001.wav
+└── speaker_03/
+	└── utterance_001.wav
+```
+
+Все WAV приводятся к 8 кГц автоматически. Дикторы сортируются по имени: первая часть используется для обучения, вторая часть — для оценки. Для текущего тестового корпуса пример структуры такой:
+
+```text
+data/russian_speech/
+├── spk_1/*.wav
+├── spk_2/*.wav
+├── spk_3/*.wav
+├── spk_4/*.wav   # train
+├── spk_5/*.wav
+├── spk_6/*.wav
+└── spk_7/*.wav   # test
+```
+
+Для другого корпуса укажите его путь:
+
+```bash
+python evaluate.py --dataset-path /path/to/dataset --num_per_scenario 3
+```
+
+Для подготовленного корпуса из пар `input.wav` и `ground_truth.json` можно обработать все записи без случайной генерации новых диалогов:
+
+```bash
+python scripts/prepare_evaluation_corpus.py \
+	--validation-path data/russian_speech_validation \
+	--output-path data/evaluation_corpus \
+	--records-per-scenario 10 \
+	--duration-sec 10
+python evaluate.py --dataset-path data/evaluation_corpus --all-corpus
+```
+
+`prepare_evaluation_corpus.py` использует весь доступный пул WAV-файлов validation-дикторов и создаёт 50 записей: по 10 для каждого сценария `normal`, `double_talk`, `high_leak_lt_10db`, `path_drift` и `third_speaker`.
+
+Ожидаемая структура подготовленного корпуса:
+
+```text
+evaluation_corpus/
+├── normal/record_001/input.wav
+├── normal/record_001/ground_truth.json
+├── double_talk/record_001/input.wav
+└── double_talk/record_001/ground_truth.json
+```
+
+В `ground_truth.json` должны быть ключи `A` и `B`, а значения — списки интервалов с полями `start`, `end` и `label`. Оценщик рекурсивно находит все пары и обрабатывает каждую запись.
 
 Основные ограничения и результаты описаны в [REPORT.md](REPORT.md), машинный отчёт оценки находится в [docs/evaluation_results.md](docs/evaluation_results.md).
 
@@ -56,4 +113,4 @@ python evaluate.py --num_per_scenario 3 --duration_sec 7.0 --seed 42
 - `scripts/` — загрузка данных и обучение;
 - `evaluate.py`, `tests/` — валидация;
 - `models/` — готовые веса;
-- `samples/` — примеры и результаты, сохранённые без изменений.
+- `samples/` — примеры и результаты

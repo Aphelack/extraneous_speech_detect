@@ -555,6 +555,15 @@ class RealSpeechLoader:
         self.target_sr = target_sr
         self._loader = None
 
+        requested_root = CommonVoiceRuLoader._resolve_path(data_root)
+        default_root = CommonVoiceRuLoader._resolve_path("data/russian_speech")
+        if requested_root != default_root:
+            if not requested_root.exists():
+                raise FileNotFoundError(f"Dataset directory not found: {requested_root}")
+            self._loader = FolderSpeechLoader(requested_root, target_sr)
+            print(f"Using dataset from: {requested_root}")
+            return
+
         # 1. Try Combined Russian + VoxCeleb1
         ru_path = CommonVoiceRuLoader._resolve_path("data/russian_speech")
         vox_path = CommonVoiceRuLoader._resolve_path("data/voxceleb1_test")

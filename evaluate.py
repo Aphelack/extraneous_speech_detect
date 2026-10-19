@@ -17,6 +17,7 @@ Evaluates:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import soundfile as sf
 import torch
 
 # Ensure single-core CPU execution for strict RTF measurement
@@ -37,6 +39,7 @@ from src.config import COLLAR_FRAMES, FRAME_DURATION_SEC, SAMPLE_RATE
 from src.data_loader import RealSpeechLoader
 from src.detector import ExtraneousSpeechDetector
 from src.embedder import SpeakerEmbedder
+from src.audio_utils import load_stereo_audio
 from src.metrics import cosine_similarity, evaluate_channels
 from src.synthesizer import TelephoneDialogueSynthesizer
 
@@ -120,7 +123,54 @@ def compute_track_purity(
     return None
 
 
+def load_prepared_records(dataset_path: str) -> List[Dict[str, Any]]:
+    """Load every input.wav and matching ground_truth.json below a corpus root."""
+    root = Path(dataset_path)
+    if not root.exists():
+        raise FileNotFoundError(f"Prepared corpus not found: {root}")
+
+    records: List[Dict[str, Any]] = []
+    for wav_path in sorted(root.rglob("*.wav")):
+        if wav_path.name != "input.wav":
+            continue
+        json_path = wav_path.with_name("ground_truth.json")
+        if not json_path.exists():
+            json_path = wav_path.with_suffix(".json")
+        if not json_path.exists():
+            raise FileNotFoundError(f"No ground-truth JSON next to {wav_path}")
+        ground_truth = json.loads(json_path.read_text(encoding="utf-8"))
+        if set(ground_truth) != {"A", "B"}:
+            raise ValueError(f"Ground truth must contain A and B channels: {json_path}")
+        audio, sample_rate = load_stereo_audio(str(wav_path), target_sr=SAMPLE_RATE)
+        references = {}
+        for channel in ("A", "B"):
+            reference_path = wav_path.with_name(f"reference_{channel}.wav")
+            if reference_path.exists():
+                reference, reference_rate = sf.read(reference_path, dtype="float32")
+                if reference_rate != sample_rate:
+                    raise ValueError(f"Reference sample rate differs from input: {reference_path}")
+                references[channel] = reference
+        scenario = wav_path.parent.parent.name
+        records.append(
+            {
+                "path": wav_path,
+                "scenario": scenario,
+                "audio": audio,
+                "sample_rate": sample_rate,
+                "ground_truth": ground_truth,
+                "num_frames": audio.shape[1] // int(SAMPLE_RATE * FRAME_DURATION_SEC),
+                "duration_sec": audio.shape[1] / sample_rate,
+                "references": references,
+            }
+        )
+    if not records:
+        raise RuntimeError(f"No WAV/JSON pairs found below {root}")
+    return records
+
+
 def run_evaluation(
+    dataset_path: str = "data/russian_speech",
+    all_corpus: bool = False,
     num_per_scenario: int = 3,
     duration_sec: float = 10.0,
     seed: int = 42,
@@ -130,21 +180,28 @@ def run_evaluation(
     print("=" * 72)
     print("EXTRANEOUS SPEECH DETECTION & CLEANING EVALUATION SUITE")
     print("=" * 72)
-    print(f"Configuration: {num_per_scenario} dialogues/scenario, {duration_sec}s per dialogue")
+    if all_corpus:
+        print("Configuration: every prepared record in the corpus")
+    else:
+        print(f"Configuration: {num_per_scenario} dialogues/scenario, {duration_sec}s per dialogue")
     print("Hardware: 1 CPU core (OMP_NUM_THREADS=1, torch.set_num_threads(1))")
-    print("Data: Real Russian speech + VoxCeleb1 (disjoint test speakers) + OpenSLR 28 RIRs")
+    mode = "prepared WAV/JSON corpus" if all_corpus else "generated speaker-folder corpus"
+    print(f"Dataset: {dataset_path} ({mode})")
     print("-" * 72)
 
-    # 1. Load test speakers
-    loader = RealSpeechLoader()
-    if hasattr(loader._loader, "get_disjoint_splits"):
-        test_spks = loader._loader.get_disjoint_splits()["test"]
+    prepared_records = load_prepared_records(dataset_path) if all_corpus else []
+    if all_corpus:
+        print(f"Prepared records: {len(prepared_records)}")
     else:
-        all_spks = list(loader.discover_speakers().keys())
-        test_spks = all_spks[len(all_spks) // 2 :]
-
-    print(f"Test speaker pool ({len(test_spks)} speakers): {test_spks[:5]} ...")
-    rng = np.random.RandomState(seed)
+        # Load test speakers from the requested speaker-folder dataset.
+        loader = RealSpeechLoader(data_root=dataset_path)
+        if hasattr(loader._loader, "get_disjoint_splits"):
+            test_spks = loader._loader.get_disjoint_splits()["test"]
+        else:
+            all_spks = list(loader.discover_speakers().keys())
+            test_spks = all_spks[len(all_spks) // 2 :]
+        print(f"Test speaker pool ({len(test_spks)} speakers): {test_spks[:5]} ...")
+        rng = np.random.RandomState(seed)
 
     # 2. Initialize models
     baseline = EnergyBaselineDetector()
@@ -173,34 +230,47 @@ def run_evaluation(
         sc: {"baseline": {"macro_f1": []}, "detector": {"macro_f1": []}} for sc in scenarios
     }
 
-    total_dialogues = len(scenarios) * num_per_scenario
+    total_dialogues = len(prepared_records) if all_corpus else len(scenarios) * num_per_scenario
     dialogue_idx = 0
 
-    for sc in scenarios:
-        for i in range(num_per_scenario):
+    work_items = []
+    if all_corpus:
+        work_items = [(record["scenario"], index, record) for index, record in enumerate(prepared_records)]
+    else:
+        for sc in scenarios:
+            for i in range(num_per_scenario):
+                work_items.append((sc, i, None))
+
+    for sc, i, prepared in work_items:
             dialogue_idx += 1
-            # Pick disjoint test speakers with 80% Russian speech preference
-            sa, sb, st = loader.sample_dialogue_speakers("test", russian_prob=0.80, rng=rng)
-
-            pool = loader.build_utterance_pool(sa, sb, st, max_per_speaker=10)
-
-            # Synthesize dialogue
-            syn_res = synth.synthesize_dialogue(
-                utterance_pool=pool,
-                duration_sec=duration_sec,
-                scenario=sc,
-                third_speaker_prob=1.0 if sc == "third_speaker" else 0.2,
-            )
-
-            stereo = syn_res.audio
-            gt = syn_res.ground_truth_intervals
-            n_frames = syn_res.num_frames
+            if prepared is None:
+                sa, sb, st = loader.sample_dialogue_speakers("test", russian_prob=0.80, rng=rng)
+                pool = loader.build_utterance_pool(sa, sb, st, max_per_speaker=10)
+                syn_res = synth.synthesize_dialogue(
+                    utterance_pool=pool,
+                    duration_sec=duration_sec,
+                    scenario=sc,
+                    third_speaker_prob=1.0 if sc == "third_speaker" else 0.2,
+                )
+                stereo = syn_res.audio
+                gt = syn_res.ground_truth_intervals
+                n_frames = syn_res.num_frames
+                sample_rate = syn_res.sample_rate
+                duration = syn_res.duration_sec
+                references = syn_res.clean_references
+            else:
+                stereo = prepared["audio"]
+                gt = prepared["ground_truth"]
+                n_frames = prepared["num_frames"]
+                sample_rate = prepared["sample_rate"]
+                duration = prepared["duration_sec"]
+                references = prepared["references"] or None
 
             # --- Baseline evaluation ---
             t0 = time.perf_counter()
-            base_preds = baseline.detect(stereo, syn_res.sample_rate)
+            base_preds = baseline.detect(stereo, sample_rate)
             t_base = time.perf_counter() - t0
-            base_rtf = t_base / duration_sec
+            base_rtf = t_base / duration
 
             m_base = evaluate_channels(gt, base_preds, num_frames=n_frames, collar_frames=COLLAR_FRAMES)
             results["baseline"]["own_f1"].append(m_base["by_label"]["own"]["f1"])
@@ -212,9 +282,9 @@ def run_evaluation(
 
             # --- Detector evaluation ---
             t0 = time.perf_counter()
-            det_preds = detector.detect(stereo, syn_res.sample_rate)
+            det_preds = detector.detect(stereo, sample_rate)
             t_det = time.perf_counter() - t0
-            det_rtf = t_det / duration_sec
+            det_rtf = t_det / duration
 
             m_det = evaluate_channels(gt, det_preds, num_frames=n_frames, collar_frames=COLLAR_FRAMES)
             results["detector"]["own_f1"].append(m_det["by_label"]["own"]["f1"])
@@ -226,16 +296,16 @@ def run_evaluation(
 
             # --- Cleaner & Purity evaluation ---
             t0 = time.perf_counter()
-            cleaned_audio = cleaner.clean(stereo, det_preds, syn_res.sample_rate)
+            cleaned_audio = cleaner.clean(stereo, det_preds, sample_rate)
             t_clean = time.perf_counter() - t0
-            clean_rtf = t_clean / duration_sec
+            clean_rtf = t_clean / duration
             results["cleaner"]["rtf"].append(clean_rtf)
 
             # Measure Speaker Purity strictly on speech segments
-            if has_embedder:
+            if has_embedder and references is not None:
                 try:
-                    sr = syn_res.sample_rate
-                    ref_a = syn_res.clean_references["A"]
+                    sr = sample_rate
+                    ref_a = references["A"]
 
                     # Metric 1: Speaker Purity on 'own' segments
                     pur_b = compute_segment_purity(stereo[0], ref_a, base_preds["A"], sr, embedder)
@@ -256,7 +326,7 @@ def run_evaluation(
                     pass
 
             # 4. Leak attenuation on pure leak intervals
-            atten = compute_leak_attenuation(stereo[0], cleaned_audio[0], gt["A"], syn_res.sample_rate)
+            atten = compute_leak_attenuation(stereo[0], cleaned_audio[0], gt["A"], sample_rate)
             if atten is not None:
                 results["cleaner"]["leak_attenuation_db"].append(atten)
 
@@ -266,12 +336,13 @@ def run_evaluation(
                 sc_dir.mkdir(parents=True, exist_ok=True)
                 from src.audio_utils import save_stereo_audio
                 from scipy.io import wavfile
-                save_stereo_audio(str(sc_dir / "input_stereo.wav"), stereo, sample_rate=syn_res.sample_rate)
-                save_stereo_audio(str(sc_dir / "cleaned_stereo.wav"), cleaned_audio, sample_rate=syn_res.sample_rate)
-                ref_int16 = (np.clip(syn_res.clean_references["A"], -1.0, 1.0) * 32767).astype(np.int16)
-                wavfile.write(str(sc_dir / "clean_reference_a.wav"), syn_res.sample_rate, ref_int16)
+                save_stereo_audio(str(sc_dir / "input_stereo.wav"), stereo, sample_rate=sample_rate)
+                save_stereo_audio(str(sc_dir / "cleaned_stereo.wav"), cleaned_audio, sample_rate=sample_rate)
+                if references is not None:
+                    ref_int16 = (np.clip(references["A"], -1.0, 1.0) * 32767).astype(np.int16)
+                    wavfile.write(str(sc_dir / "clean_reference_a.wav"), sample_rate, ref_int16)
 
-            sys.stdout.write(f"\rProcessed {dialogue_idx}/{total_dialogues} dialogues [{sc}]...")
+            sys.stdout.write(f"\rProcessed {dialogue_idx}/{total_dialogues} records [{sc}]...")
             sys.stdout.flush()
 
     print("\n" + "=" * 72)
@@ -329,7 +400,7 @@ def run_evaluation(
     with open(output_report, "w", encoding="utf-8") as f:
         f.write("# Результаты сравнительного тестирования: Baseline vs Detector vs Cleaner\n\n")
         f.write(f"- **Дата и время**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"- **Тестовый корпус**: Скрытые дикторы из Russian Speech + VoxCeleb1 (не участвовали в обучении)\n")
+        f.write(f"- **Тестовый корпус**: `{dataset_path}` (дикторы из тестовой части разбиения)\n")
         f.write(f"- **Акустика**: Реальные импульсные характеристики (RIR) и шумы из OpenSLR 28\n")
         f.write(f"- **Аппаратные ограничения**: 1 ядро CPU (`OMP_NUM_THREADS=1`, лимит RTF <= 0.0667)\n\n")
         f.write("### Сводная таблица метрик (Collar 50 мс)\n\n")
@@ -365,7 +436,20 @@ def run_evaluation(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate baseline and detector on realistic telephone dialogues.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate baseline and detector using a speaker-folder dataset."
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default="data/russian_speech",
+        help="Speaker-folder dataset or prepared corpus root (default: data/russian_speech)",
+    )
+    parser.add_argument(
+        "--all-corpus",
+        action="store_true",
+        help="Evaluate every input.wav + ground_truth.json pair below --dataset-path",
+    )
     parser.add_argument("--num_per_scenario", type=int, default=2, help="Number of dialogues per scenario")
     parser.add_argument("--duration_sec", type=float, default=7.0, help="Duration of each synthesized dialogue in seconds")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
@@ -374,6 +458,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_evaluation(
+        dataset_path=args.dataset_path,
+        all_corpus=args.all_corpus,
         num_per_scenario=args.num_per_scenario,
         duration_sec=args.duration_sec,
         seed=args.seed,

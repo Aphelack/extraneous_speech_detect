@@ -1,0 +1,54 @@
+{
+  "A": [
+    {
+      "start": 0.5,
+      "end": 2.8,
+      "label": "own",
+      "score": 0.9818
+    },
+    {
+      "start": 2.9,
+      "end": 3.17,
+      "label": "third",
+      "score": 0.6904
+    },
+    {
+      "start": 3.1,
+      "end": 4.85,
+      "label": "leak",
+      "score": 0.9796
+    },
+    {
+      "start": 4.61,
+      "end": 4.97,
+      "label": "third",
+      "score": 0.534
+    },
+    {
+      "start": 4.93,
+      "end": 5.4,
+      "label": "leak",
+      "score": 0.8178
+    },
+    {
+      "start": 5.51,
+      "end": 5.63,
+      "label": "own",
+      "score": 0.5839
+    }
+  ],
+  "B": [
+    {
+      "start": 0.51,
+      "end": 2.7,
+      "label": "leak",
+      "score": 0.9811
+    },
+    {
+      "start": 3.13,
+      "end": 5.19,
+      "label": "own",
+      "score": 0.9632
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "scenario": "high_leak_lt_10db",
+  "record": 5,
+  "seed": 4405,
+  "sample_rate": 8000,
+  "duration_sec": 7.0,
+  "speakers": {
+    "A": "ru_spk_6",
+    "B": "ru_spk_7",
+    "third": "ru_spk_5"
+  },
+  "leak_delay_sec": 0.2777507906622999,
+  "leak_attenuation_db": 7.79690827060481,
+  "snr_db": 18.748568119937087,
+  "has_third_speaker": true
+}

@@ -1,0 +1,16 @@
+{
+  "scenario": "path_drift",
+  "record": 3,
+  "seed": 4503,
+  "sample_rate": 8000,
+  "duration_sec": 7.0,
+  "speakers": {
+    "A": "ru_spk_7",
+    "B": "ru_spk_6",
+    "third": "ru_spk_5"
+  },
+  "leak_delay_sec": 0.21923952751838063,
+  "leak_attenuation_db": 18.163776149619316,
+  "snr_db": 23.70039034723782,
+  "has_third_speaker": false
+}

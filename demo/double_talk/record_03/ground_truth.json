@@ -1,0 +1,102 @@
+{
+  "A": [
+    {
+      "start": 0.5,
+      "end": 2.6425,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 1.6845,
+      "end": 3.7589,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 2.4164,
+      "end": 4.8235,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 4.266,
+      "end": 5.8931,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 5.0774,
+      "end": 6.4999,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 5.4391,
+      "end": 6.7558,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 5.4637,
+      "end": 6.5,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 5.9769,
+      "end": 6.7559,
+      "label": "leak",
+      "score": 1.0
+    }
+  ],
+  "B": [
+    {
+      "start": 0.54,
+      "end": 2.6825,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 1.4286,
+      "end": 3.503,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 2.4564,
+      "end": 4.8635,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 4.0101,
+      "end": 5.6372,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 5.1174,
+      "end": 6.5399,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 5.1832,
+      "end": 6.4999,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 5.5037,
+      "end": 6.54,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 5.721,
+      "end": 6.5,
+      "label": "own",
+      "score": 1.0
+    }
+  ]
+}

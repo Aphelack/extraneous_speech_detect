@@ -1,0 +1,42 @@
+{
+  "A": [
+    {
+      "start": 0.5,
+      "end": 2.2616,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 3.2332,
+      "end": 4.9595,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 5.2566,
+      "end": 6.5,
+      "label": "own",
+      "score": 1.0
+    }
+  ],
+  "B": [
+    {
+      "start": 0.54,
+      "end": 2.3016,
+      "label": "leak",
+      "score": 1.0
+    },
+    {
+      "start": 3.0036,
+      "end": 4.7299,
+      "label": "own",
+      "score": 1.0
+    },
+    {
+      "start": 5.2966,
+      "end": 6.54,
+      "label": "leak",
+      "score": 1.0
+    }
+  ]
+}
