@@ -22,7 +22,7 @@ import torch.nn as nn
 from src.data_loader import RealSpeechLoader
 from src.detector import _DetectorNet
 from src.features import FeatureExtractor
-from src.metrics import intervals_to_frame_matrix, precision_recall_f1
+from src.metrics import count_frame_errors, f1_from_counts, intervals_to_frame_matrix
 from src.synthesizer import TelephoneDialogueSynthesizer
 
 
@@ -49,19 +49,18 @@ def train_detector(
     synth = TelephoneDialogueSynthesizer(seed=seed)
     fe = FeatureExtractor()
 
-    scenarios = ["normal", "double_talk", "high_leak_lt_10db", "path_drift", "third_speaker"]
-    
-    # 48 dialogues per scenario = 240 total Russian dialogues.
+    scenarios = ["normal", "double_talk", "high_leak_lt_10db", "path_drift", "third_speaker", "no_leak"]
+
     scenario_counts = {sc: dialogues_per_scenario for sc in scenarios}
 
     dialogues_x: List[np.ndarray] = []
     dialogues_y: List[np.ndarray] = []
 
-    print(f"Synthesizing dialogues with OpenSLR 28 RIRs (80% Russian speaker preference)...")
+    print("Synthesizing dialogues with OpenSLR 28 RIRs (VoxCeleb1 + Russian speakers)...")
     for sc, n_d in scenario_counts.items():
         print(f"  Generating {n_d} dialogues for scenario: {sc}")
         for _ in range(n_d):
-            sa, sb, st = loader.sample_dialogue_speakers("train", russian_prob=0.80, rng=rng)
+            sa, sb, st = loader.sample_dialogue_speakers("train", russian_prob=0.25, rng=rng)
 
             pool = loader.build_utterance_pool(sa, sb, st, max_per_speaker=8)
             dur = float(synth.rng.uniform(7.0, 11.0))
@@ -90,6 +89,11 @@ def train_detector(
 
     in_dim = all_x.shape[1]
     model = _DetectorNet(in_features=in_dim, hidden_dim=48, num_classes=3)
+    # Store standardization statistics as buffers -> they become part of the
+    # state_dict and are loaded safely with weights_only=True.
+    with torch.no_grad():
+        model.feat_mean.copy_(torch.tensor(mean.reshape(1, in_dim, 1), dtype=torch.float32))
+        model.feat_std.copy_(torch.tensor(std.reshape(1, in_dim, 1), dtype=torch.float32))
 
     # Class balancing weights: pos_weight = [1.0, 1.2, 1.3]
     all_y = np.vstack(dialogues_y)
@@ -98,16 +102,18 @@ def train_detector(
     n_third = int(np.sum(all_y[:, 2]))
     print(f"Class frame distribution -> Own: {n_own}, Leak: {n_leak}, Third: {n_third}")
 
-    pos_weight = torch.tensor([1.0, 1.2, 1.3], dtype=torch.float32).unsqueeze(1)
+    # `third` is the rarest class (~5% of frames) and is easily confused with
+    # `leak`; give it a substantially higher positive weight.
+    pos_weight = torch.tensor([1.0, 1.5, 4.0], dtype=torch.float32).unsqueeze(1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # Convert sequences to normalized tensors
+    # Convert sequences to tensors. Standardization happens inside the model
+    # via the feat_mean / feat_std buffers, so raw features are stored here.
     norm_sequences = []
     for x_seq, y_seq in zip(dialogues_x, dialogues_y):
-        x_norm = (x_seq - mean) / std
         # (T, C) -> (1, C, T)
-        t_x = torch.tensor(x_norm, dtype=torch.float32).transpose(0, 1).unsqueeze(0)
+        t_x = torch.tensor(x_seq, dtype=torch.float32).transpose(0, 1).unsqueeze(0)
         # (T, 3) -> (1, 3, T)
         t_y = torch.tensor(y_seq, dtype=torch.float32).transpose(0, 1).unsqueeze(0)
         norm_sequences.append((t_x, t_y))
@@ -138,14 +144,18 @@ def train_detector(
         scheduler.step()
 
         model.eval()
-        val_scores = []
+        # Global micro-F1 over all validation frames (counts summed, F1 once).
+        val_counts = np.zeros((3, 3), dtype=np.int64)  # [class, (tp, fp, fn)]
         with torch.no_grad():
             for idx in val_indices:
                 t_x, t_y = norm_sequences[idx]
                 pred = (torch.sigmoid(model(t_x)).squeeze(0).transpose(0, 1).numpy() >= 0.5)
                 truth = t_y.squeeze(0).transpose(0, 1).numpy().astype(bool)
-                val_scores.append([precision_recall_f1(truth[:, col], pred[:, col])["f1"] for col in range(3)])
-        val_macro = float(np.mean(val_scores)) if val_scores else 0.0
+                for col in range(3):
+                    tp, fp, fn = count_frame_errors(truth[:, col], pred[:, col])
+                    val_counts[col] += (tp, fp, fn)
+        val_f1s = [f1_from_counts(*val_counts[col])["f1"] for col in range(3)]
+        val_macro = float(np.mean(val_f1s)) if val_f1s else 0.0
         if val_macro > best_macro:
             best_macro = val_macro
             best_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
@@ -166,12 +176,13 @@ def train_detector(
     out_dir = Path(weights_path).parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Only tensors and primitive metadata are stored, so the checkpoint can be
+    # loaded with torch.load(..., weights_only=True). mean/std live in the
+    # state_dict as feat_mean / feat_std buffers.
     save_dict = {
         "model_state_dict": model.state_dict(),
-        "mean": mean,
-        "std": std,
-        "in_dim": in_dim,
-        "feature_names": fe.extract_features(np.zeros((2, 160), dtype=np.float32))["feature_names"],
+        "in_dim": int(in_dim),
+        "feature_names": list(fe.extract_features(np.zeros((2, 160), dtype=np.float32))["feature_names"]),
         "architecture": "1D-TCN",
         "dilations": [1, 2, 4, 8],
     }

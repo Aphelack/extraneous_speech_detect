@@ -162,13 +162,60 @@ def compute_boundary_collar_mask(
     return collar_mask
 
 
+def count_frame_errors(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    collar_frames: int = COLLAR_FRAMES,
+) -> Tuple[int, int, int]:
+    """Count TP / FP / FN frames, excluding the boundary collar entirely.
+
+    Frames within ``collar_frames`` of any ground-truth transition are removed
+    from the evaluation: they contribute neither TP, nor FP, nor FN. This is
+    the strict protocol used by the reviewers, and it is the only mode
+    supported for the reported metrics.
+
+    Returns
+    -------
+    (tp, fp, fn) : tuple of int
+    """
+    y_t = np.asarray(y_true, dtype=bool)
+    y_p = np.asarray(y_pred, dtype=bool)
+
+    if len(y_t) != len(y_p):
+        raise ValueError(f"Length mismatch: y_true ({len(y_t)}) vs y_pred ({len(y_p)})")
+
+    if len(y_t) == 0:
+        return 0, 0, 0
+
+    if collar_frames > 0:
+        eval_mask = ~compute_boundary_collar_mask(y_t, collar_frames=collar_frames)
+    else:
+        eval_mask = np.ones(len(y_t), dtype=bool)
+
+    tp = int(np.sum(y_t & y_p & eval_mask))
+    fp = int(np.sum((~y_t) & y_p & eval_mask))
+    fn = int(np.sum(y_t & (~y_p) & eval_mask))
+    return tp, fp, fn
+
+
+def f1_from_counts(tp: int, fp: int, fn: int) -> Dict[str, float]:
+    """Compute precision / recall / F1 from accumulated TP, FP, FN counts."""
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+    recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    if (precision + recall) > 0:
+        f1 = float(2 * precision * recall / (precision + recall))
+    else:
+        f1 = 0.0
+    return {"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
+
+
 def precision_recall_f1(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     collar_frames: int = COLLAR_FRAMES,
-    mode: str = "forgive",
+    mode: str = "exclude",
 ) -> Dict[str, float]:
-    """Calculate frame-level Precision, Recall, and F1 with boundary collar tolerance.
+    """Frame-level Precision, Recall and F1 with strict boundary-collar exclusion.
 
     Parameters
     ----------
@@ -177,76 +224,104 @@ def precision_recall_f1(
     y_pred : np.ndarray
         Binary predicted frames (shape [N]).
     collar_frames : int
-        Tolerance window on boundaries (default 5 frames = 50 ms).
-    mode : str, {"forgive", "exclude"}
-        - "forgive" (recommended for speech segmentation): True Positives count
-          everywhere. False Positives and False Negatives occurring inside
-          the boundary collar are forgiven (not penalized).
-        - "exclude": All frames within the collar of ground truth boundaries
-          are completely excluded from precision and recall computation.
+        Collar radius in frames (default 5 frames = 50 ms).
+    mode : str, {"exclude", "forgive"}
+        - "exclude" (default, used for all reported metrics): frames within the
+          collar of a ground-truth boundary are removed from TP/FP/FN entirely.
+        - "forgive": legacy mode kept only for backwards compatibility; it
+          counts TP inside the collar and is NOT used for reported results.
 
     Returns
     -------
     dict with keys: 'precision', 'recall', 'f1', 'tp', 'fp', 'fn'
     """
+    if mode == "exclude":
+        tp, fp, fn = count_frame_errors(y_true, y_pred, collar_frames=collar_frames)
+        return f1_from_counts(tp, fp, fn)
+
+    if mode != "forgive":
+        raise ValueError(f"Unknown collar mode: {mode}. Must be 'exclude' or 'forgive'.")
+
     y_t = np.asarray(y_true, dtype=bool)
     y_p = np.asarray(y_pred, dtype=bool)
-
     if len(y_t) != len(y_p):
-        raise ValueError(
-            f"Length mismatch: y_true ({len(y_t)}) vs y_pred ({len(y_p)})"
-        )
-
+        raise ValueError(f"Length mismatch: y_true ({len(y_t)}) vs y_pred ({len(y_p)})")
     if len(y_t) == 0:
-        return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "tp": 0, "fp": 0, "fn": 0}
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "tp": 0, "fp": 0, "fn": 0}
 
-    # If collar is 0, standard frame-level classification metrics
     if collar_frames <= 0:
         tp = int(np.sum(y_t & y_p))
         fp = int(np.sum((~y_t) & y_p))
         fn = int(np.sum(y_t & (~y_p)))
     else:
         collar = compute_boundary_collar_mask(y_t, collar_frames=collar_frames)
-        if mode == "exclude":
-            eval_mask = ~collar
-            tp = int(np.sum(y_t & y_p & eval_mask))
-            fp = int(np.sum((~y_t) & y_p & eval_mask))
-            fn = int(np.sum(y_t & (~y_p) & eval_mask))
-        elif mode == "forgive":
-            # True Positives always counted
-            tp = int(np.sum(y_t & y_p))
-            # Errors inside the boundary collar are forgiven
-            fp = int(np.sum((~y_t) & y_p & (~collar)))
-            fn = int(np.sum(y_t & (~y_p) & (~collar)))
-        else:
-            raise ValueError(f"Unknown collar mode: {mode}. Must be 'forgive' or 'exclude'.")
+        tp = int(np.sum(y_t & y_p))
+        fp = int(np.sum((~y_t) & y_p & (~collar)))
+        fn = int(np.sum(y_t & (~y_p) & (~collar)))
 
-    # Precision
-    if (tp + fp) == 0:
-        precision = 1.0 if fp == 0 else 0.0
-    else:
-        precision = float(tp / (tp + fp))
+    return f1_from_counts(tp, fp, fn)
 
-    # Recall
-    if (tp + fn) == 0:
-        recall = 1.0 if fn == 0 else 0.0
-    else:
-        recall = float(tp / (tp + fn))
 
-    # F1
-    if (precision + recall) == 0:
-        f1 = 0.0
-    else:
-        f1 = float(2 * precision * recall / (precision + recall))
+class FrameCountAccumulator:
+    """Accumulates TP / FP / FN frame counts across records and channels.
 
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-    }
+    The reported F1 is a *global micro-F1*: counts are summed over every frame
+    of every test recording and both channels, and F1 is computed once per
+    label at the very end. Per-record averaging is deliberately not used,
+    because it inflates F1 for labels that are absent from most recordings
+    (e.g. ``third`` in 80% of the tracks).
+    """
+
+    def __init__(self, labels: Sequence[str] = EVAL_LABELS):
+        self.labels = tuple(labels)
+        self.counts: Dict[str, List[int]] = {lbl: [0, 0, 0] for lbl in self.labels}
+        self.records = 0
+
+    def add(
+        self,
+        ground_truth: Dict[str, List[Dict[str, Any]]],
+        predictions: Dict[str, List[Dict[str, Any]]],
+        num_frames: int,
+        frame_sec: float = FRAME_DURATION_SEC,
+        collar_frames: int = COLLAR_FRAMES,
+    ) -> Dict[str, Dict[str, int]]:
+        """Add one recording (both channels) to the accumulator."""
+        record_counts: Dict[str, Dict[str, int]] = {}
+        for ch in ("A", "B"):
+            gt_masks = intervals_to_frame_matrix(
+                ground_truth.get(ch, []), num_frames, frame_sec=frame_sec, labels=self.labels
+            )
+            pred_masks = intervals_to_frame_matrix(
+                predictions.get(ch, []), num_frames, frame_sec=frame_sec, labels=self.labels
+            )
+            for lbl in self.labels:
+                tp, fp, fn = count_frame_errors(
+                    gt_masks[lbl], pred_masks[lbl], collar_frames=collar_frames
+                )
+                self.counts[lbl][0] += tp
+                self.counts[lbl][1] += fp
+                self.counts[lbl][2] += fn
+                record_counts.setdefault(lbl, {"tp": 0, "fp": 0, "fn": 0})
+                record_counts[lbl]["tp"] += tp
+                record_counts[lbl]["fp"] += fp
+                record_counts[lbl]["fn"] += fn
+        self.records += 1
+        return record_counts
+
+    def finalize(self) -> Dict[str, Any]:
+        """Compute the global micro-F1 per label and the macro average."""
+        by_label: Dict[str, Dict[str, float]] = {}
+        f1s: List[float] = []
+        for lbl in self.labels:
+            tp, fp, fn = self.counts[lbl]
+            metrics = f1_from_counts(tp, fp, fn)
+            by_label[lbl] = metrics
+            f1s.append(metrics["f1"])
+        return {
+            "by_label": by_label,
+            "macro_f1": float(np.mean(f1s)) if f1s else 0.0,
+            "records": self.records,
+        }
 
 
 def evaluate_channels(
@@ -256,9 +331,14 @@ def evaluate_channels(
     frame_sec: float = FRAME_DURATION_SEC,
     collar_frames: int = COLLAR_FRAMES,
     labels: Sequence[str] = EVAL_LABELS,
-    mode: str = "forgive",
+    mode: str = "exclude",
 ) -> Dict[str, Any]:
-    """Evaluate multi-label predictions across channels 'A' and 'B'.
+    """Evaluate one recording, returning per-channel counts and count-based F1.
+
+    F1 values returned here are computed from summed TP/FP/FN of that single
+    recording (both channels together), never by averaging per-channel F1.
+    For the headline numbers use :class:`FrameCountAccumulator`, which sums
+    counts over the whole test set.
 
     Parameters
     ----------
@@ -275,46 +355,49 @@ def evaluate_channels(
     labels : sequence of str
         Labels to evaluate ("own", "leak", "third").
     mode : str
-        Collar handling mode ("forgive" or "exclude").
+        Collar handling mode ("exclude" is the only mode used for reporting).
 
     Returns
     -------
-    dict with detailed per-channel, per-label metrics and macro F1 scores.
+    dict with per-channel counts, per-label counts and count-based F1.
     """
+    if mode != "exclude":
+        raise ValueError("Only strict collar exclusion ('exclude') is supported for reporting.")
+
     results: Dict[str, Any] = {
         "by_channel": {},
         "by_label": {},
         "macro_f1": 0.0,
     }
 
-    label_f1s: Dict[str, List[float]] = {lbl: [] for lbl in labels}
+    totals: Dict[str, List[int]] = {lbl: [0, 0, 0] for lbl in labels}
 
     for ch in ("A", "B"):
-        gt_intervals = ground_truth.get(ch, [])
-        pred_intervals = predictions.get(ch, [])
-
-        gt_masks = intervals_to_frame_matrix(gt_intervals, num_frames, frame_sec=frame_sec, labels=labels)
-        pred_masks = intervals_to_frame_matrix(pred_intervals, num_frames, frame_sec=frame_sec, labels=labels)
+        gt_masks = intervals_to_frame_matrix(
+            ground_truth.get(ch, []), num_frames, frame_sec=frame_sec, labels=labels
+        )
+        pred_masks = intervals_to_frame_matrix(
+            predictions.get(ch, []), num_frames, frame_sec=frame_sec, labels=labels
+        )
 
         results["by_channel"][ch] = {}
         for lbl in labels:
-            m = precision_recall_f1(
-                gt_masks[lbl],
-                pred_masks[lbl],
-                collar_frames=collar_frames,
-                mode=mode,
+            tp, fp, fn = count_frame_errors(
+                gt_masks[lbl], pred_masks[lbl], collar_frames=collar_frames
             )
-            results["by_channel"][ch][lbl] = m
-            label_f1s[lbl].append(m["f1"])
+            results["by_channel"][ch][lbl] = {"tp": tp, "fp": fp, "fn": fn}
+            totals[lbl][0] += tp
+            totals[lbl][1] += fp
+            totals[lbl][2] += fn
 
-    # Aggregate across channels for each label
-    all_f1s = []
+    f1s: List[float] = []
     for lbl in labels:
-        mean_f1 = float(np.mean(label_f1s[lbl]))
-        results["by_label"][lbl] = {"f1": mean_f1}
-        all_f1s.append(mean_f1)
+        tp, fp, fn = totals[lbl]
+        metrics = f1_from_counts(tp, fp, fn)
+        results["by_label"][lbl] = metrics
+        f1s.append(metrics["f1"])
 
-    results["macro_f1"] = float(np.mean(all_f1s)) if all_f1s else 0.0
+    results["macro_f1"] = float(np.mean(f1s)) if f1s else 0.0
     return results
 
 

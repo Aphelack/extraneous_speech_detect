@@ -35,12 +35,16 @@ torch.set_num_threads(1)
 
 from src.baseline import EnergyBaselineDetector
 from src.cleaner import TelephoneAudioCleaner
-from src.config import COLLAR_FRAMES, FRAME_DURATION_SEC, SAMPLE_RATE
+from src.config import COLLAR_FRAMES, FRAME_DURATION_SEC, LABEL_LEAK, SAMPLE_RATE
 from src.data_loader import RealSpeechLoader
 from src.detector import ExtraneousSpeechDetector
 from src.embedder import SpeakerEmbedder
 from src.audio_utils import load_stereo_audio
-from src.metrics import cosine_similarity, evaluate_channels
+from src.metrics import (
+    FrameCountAccumulator,
+    cosine_similarity,
+    intervals_to_frame_matrix,
+)
 from src.synthesizer import TelephoneDialogueSynthesizer
 
 
@@ -217,18 +221,28 @@ def run_evaluation(
 
     synth = TelephoneDialogueSynthesizer(seed=seed)
 
-    scenarios = ["normal", "double_talk", "high_leak_lt_10db", "path_drift", "third_speaker"]
-    
-    # Storage for metrics
+    scenarios = ["normal", "double_talk", "high_leak_lt_10db", "path_drift", "third_speaker", "no_leak"]
+
+    # Global micro-F1 accumulators: TP/FP/FN are summed over every frame of
+    # every recording and both channels, then F1 is computed once per label.
+    base_acc = FrameCountAccumulator()
+    det_acc = FrameCountAccumulator()
+    scenario_acc: Dict[str, Dict[str, FrameCountAccumulator]] = {
+        sc: {"baseline": FrameCountAccumulator(), "detector": FrameCountAccumulator()}
+        for sc in scenarios
+    }
+
+    # Storage for non-F1 metrics
     results: Dict[str, Dict[str, List[float]]] = {
-        "baseline": {"own_f1": [], "leak_f1": [], "third_f1": [], "macro_f1": [], "rtf": [], "purity": []},
-        "detector": {"own_f1": [], "leak_f1": [], "third_f1": [], "macro_f1": [], "rtf": [], "purity": []},
+        "baseline": {"rtf": [], "purity": []},
+        "detector": {"rtf": [], "purity": []},
         "cleaner": {"rtf": [], "track_purity_raw": [], "track_purity_clean": [], "leak_attenuation_db": []},
     }
 
-    scenario_breakdown: Dict[str, Dict[str, Dict[str, List[float]]]] = {
-        sc: {"baseline": {"macro_f1": []}, "detector": {"macro_f1": []}} for sc in scenarios
-    }
+    # False-positive rate for `leak` on records where the counterpart speaks
+    # but no leak exists (the "no_leak" slice).
+    no_leak_fp = {"baseline": 0, "detector": 0}
+    no_leak_neg = {"baseline": 0, "detector": 0}
 
     total_dialogues = len(prepared_records) if all_corpus else len(scenarios) * num_per_scenario
     dialogue_idx = 0
@@ -244,7 +258,7 @@ def run_evaluation(
     for sc, i, prepared in work_items:
             dialogue_idx += 1
             if prepared is None:
-                sa, sb, st = loader.sample_dialogue_speakers("test", russian_prob=0.80, rng=rng)
+                sa, sb, st = loader.sample_dialogue_speakers("test", russian_prob=0.25, rng=rng)
                 pool = loader.build_utterance_pool(sa, sb, st, max_per_speaker=10)
                 syn_res = synth.synthesize_dialogue(
                     utterance_pool=pool,
@@ -272,31 +286,50 @@ def run_evaluation(
             t_base = time.perf_counter() - t0
             base_rtf = t_base / duration
 
-            m_base = evaluate_channels(gt, base_preds, num_frames=n_frames, collar_frames=COLLAR_FRAMES)
-            results["baseline"]["own_f1"].append(m_base["by_label"]["own"]["f1"])
-            results["baseline"]["leak_f1"].append(m_base["by_label"]["leak"]["f1"])
-            results["baseline"]["third_f1"].append(m_base["by_label"]["third"]["f1"])
-            results["baseline"]["macro_f1"].append(m_base["macro_f1"])
+            base_acc.add(gt, base_preds, num_frames=n_frames, collar_frames=COLLAR_FRAMES)
+            if sc in scenario_acc:
+                scenario_acc[sc]["baseline"].add(
+                    gt, base_preds, num_frames=n_frames, collar_frames=COLLAR_FRAMES
+                )
             results["baseline"]["rtf"].append(base_rtf)
-            scenario_breakdown[sc]["baseline"]["macro_f1"].append(m_base["macro_f1"])
 
             # --- Detector evaluation ---
             t0 = time.perf_counter()
-            det_preds = detector.detect(stereo, sample_rate)
+            det_probs = detector.predict_probabilities(stereo, sample_rate)
+            det_preds = detector.predict_intervals(stereo, sample_rate, probabilities=det_probs)
             t_det = time.perf_counter() - t0
             det_rtf = t_det / duration
 
-            m_det = evaluate_channels(gt, det_preds, num_frames=n_frames, collar_frames=COLLAR_FRAMES)
-            results["detector"]["own_f1"].append(m_det["by_label"]["own"]["f1"])
-            results["detector"]["leak_f1"].append(m_det["by_label"]["leak"]["f1"])
-            results["detector"]["third_f1"].append(m_det["by_label"]["third"]["f1"])
-            results["detector"]["macro_f1"].append(m_det["macro_f1"])
+            det_acc.add(gt, det_preds, num_frames=n_frames, collar_frames=COLLAR_FRAMES)
+            if sc in scenario_acc:
+                scenario_acc[sc]["detector"].add(
+                    gt, det_preds, num_frames=n_frames, collar_frames=COLLAR_FRAMES
+                )
             results["detector"]["rtf"].append(det_rtf)
-            scenario_breakdown[sc]["detector"]["macro_f1"].append(m_det["macro_f1"])
+
+            # --- no_leak slice: leak false-positive rate ---
+            # Denominator = frames where the counterpart is speaking but no
+            # leak exists on this track. This is exactly the failure mode the
+            # reviewers observed (leak=1 merely because B is talking).
+            if sc == "no_leak":
+                for name, preds in (("baseline", base_preds), ("detector", det_preds)):
+                    for ch, other in (("A", "B"), ("B", "A")):
+                        gt_leak = intervals_to_frame_matrix(
+                            gt.get(ch, []), n_frames, labels=(LABEL_LEAK,)
+                        )[LABEL_LEAK]
+                        pred_leak = intervals_to_frame_matrix(
+                            preds.get(ch, []), n_frames, labels=(LABEL_LEAK,)
+                        )[LABEL_LEAK]
+                        counterpart_speaking = intervals_to_frame_matrix(
+                            gt.get(other, []), n_frames, labels=("own",)
+                        )["own"]
+                        negatives = counterpart_speaking & ~gt_leak
+                        no_leak_fp[name] += int(np.sum(pred_leak & negatives))
+                        no_leak_neg[name] += int(np.sum(negatives))
 
             # --- Cleaner & Purity evaluation ---
             t0 = time.perf_counter()
-            cleaned_audio = cleaner.clean(stereo, det_preds, sample_rate)
+            cleaned_audio = cleaner.clean(stereo, det_preds, sample_rate, probabilities=det_probs)
             t_clean = time.perf_counter() - t0
             clean_rtf = t_clean / duration
             results["cleaner"]["rtf"].append(clean_rtf)
@@ -349,18 +382,24 @@ def run_evaluation(
     print("EVALUATION RESULTS SUMMARY")
     print("=" * 72)
 
-    # Format Metrics
-    b_own = np.mean(results["baseline"]["own_f1"])
-    b_leak = np.mean(results["baseline"]["leak_f1"])
-    b_third = np.mean(results["baseline"]["third_f1"])
-    b_macro = np.mean(results["baseline"]["macro_f1"])
+    # Global micro-F1 over all frames of all records and both channels.
+    base_global = base_acc.finalize()
+    det_global = det_acc.finalize()
+
+    b_own = base_global["by_label"]["own"]["f1"]
+    b_leak = base_global["by_label"]["leak"]["f1"]
+    b_third = base_global["by_label"]["third"]["f1"]
+    b_macro = base_global["macro_f1"]
     b_rtf = np.mean(results["baseline"]["rtf"])
 
-    d_own = np.mean(results["detector"]["own_f1"])
-    d_leak = np.mean(results["detector"]["leak_f1"])
-    d_third = np.mean(results["detector"]["third_f1"])
-    d_macro = np.mean(results["detector"]["macro_f1"])
+    d_own = det_global["by_label"]["own"]["f1"]
+    d_leak = det_global["by_label"]["leak"]["f1"]
+    d_third = det_global["by_label"]["third"]["f1"]
+    d_macro = det_global["macro_f1"]
     d_rtf = np.mean(results["detector"]["rtf"])
+
+    b_leak_fpr = (no_leak_fp["baseline"] / no_leak_neg["baseline"]) if no_leak_neg["baseline"] else 0.0
+    d_leak_fpr = (no_leak_fp["detector"] / no_leak_neg["detector"]) if no_leak_neg["detector"] else 0.0
 
     c_rtf = np.mean(results["cleaner"]["rtf"])
     tot_rtf = d_rtf + c_rtf
@@ -373,10 +412,11 @@ def run_evaluation(
 
     print(f"{'Metric':<40} | {'Baseline / Raw':<16} | {'Our Model / Cleaned':<20} | {'Delta / Status':<16}")
     print("-" * 98)
-    print(f"{'Own F1 (collar 50ms)':<40} | {b_own:<16.4f} | {d_own:<20.4f} | {d_own - b_own:+.4f}")
-    print(f"{'Leak F1 (collar 50ms)':<40} | {b_leak:<16.4f} | {d_leak:<20.4f} | {d_leak - b_leak:+.4f}")
-    print(f"{'Third F1 (collar 50ms)':<40} | {b_third:<16.4f} | {d_third:<20.4f} | {d_third - b_third:+.4f}")
-    print(f"{'Macro F1 (all classes)':<40} | {b_macro:<16.4f} | {d_macro:<20.4f} | {d_macro - b_macro:+.4f}")
+    print(f"{'Own F1 (global micro, collar excl.)':<40} | {b_own:<16.4f} | {d_own:<20.4f} | {d_own - b_own:+.4f}")
+    print(f"{'Leak F1 (global micro, collar excl.)':<40} | {b_leak:<16.4f} | {d_leak:<20.4f} | {d_leak - b_leak:+.4f}")
+    print(f"{'Third F1 (global micro, collar excl.)':<40} | {b_third:<16.4f} | {d_third:<20.4f} | {d_third - b_third:+.4f}")
+    print(f"{'Macro F1 (global micro)':<40} | {b_macro:<16.4f} | {d_macro:<20.4f} | {d_macro - b_macro:+.4f}")
+    print(f"{'Leak FPR on no_leak records':<40} | {b_leak_fpr:<16.4f} | {d_leak_fpr:<20.4f} | {'lower is better':<16}")
     print(f"{'RTF Detector (1 CPU core)':<40} | {b_rtf:<16.5f} | {d_rtf:<20.5f} | {'Pass (<=0.0667)':<16}")
     print(f"{'RTF Cleaner (1 CPU core)':<40} | {'-':<16} | {c_rtf:<20.5f} | {'Pass (<=0.0667)':<16}")
     print(f"{'Total Pipeline RTF (1 CPU)':<40} | {'-':<16} | {tot_rtf:<20.5f} | {'Pass (<=0.0667)':<16}")
@@ -386,13 +426,15 @@ def run_evaluation(
     print(f"{'Leak Attenuation (dB)':<40} | {'-':<16} | {leak_atten:<17.2f} dB | {'Suppression':<16}")
     print("-" * 98)
 
-    print("\nScenario Breakdown (Macro F1):")
+    print("\nScenario Breakdown (global micro Macro F1):")
     print(f"{'Scenario':<22} | {'Baseline':<12} | {'Detector':<12} | {'Delta':<8}")
     print("-" * 60)
+    scenario_metrics: Dict[str, Dict[str, Dict[str, float]]] = {}
     for sc in scenarios:
-        b_sc = np.mean(scenario_breakdown[sc]["baseline"]["macro_f1"])
-        d_sc = np.mean(scenario_breakdown[sc]["detector"]["macro_f1"])
-        print(f"{sc:<22} | {b_sc:<12.4f} | {d_sc:<12.4f} | {d_sc - b_sc:+.4f}")
+        b_sc = scenario_acc[sc]["baseline"].finalize()
+        d_sc = scenario_acc[sc]["detector"].finalize()
+        scenario_metrics[sc] = {"baseline": b_sc, "detector": d_sc}
+        print(f"{sc:<22} | {b_sc['macro_f1']:<12.4f} | {d_sc['macro_f1']:<12.4f} | {d_sc['macro_f1'] - b_sc['macro_f1']:+.4f}")
     print("-" * 60)
 
     # Save to Markdown Report
@@ -403,13 +445,16 @@ def run_evaluation(
         f.write(f"- **Тестовый корпус**: `{dataset_path}` (дикторы из тестовой части разбиения)\n")
         f.write(f"- **Акустика**: Реальные импульсные характеристики (RIR) и шумы из OpenSLR 28\n")
         f.write(f"- **Аппаратные ограничения**: 1 ядро CPU (`OMP_NUM_THREADS=1`, лимит RTF <= 0.0667)\n\n")
-        f.write("### Сводная таблица метрик (Collar 50 мс)\n\n")
+        f.write("### Сводная таблица метрик (глобальный micro-F1, collar 50 мс исключён)\n\n")
+        f.write("TP/FP/FN суммируются по всем кадрам всех записей и обеих дорожек; F1 считается один раз на класс.\n")
+        f.write("Кадры в пределах 50 мс от границы эталона полностью исключены из подсчёта.\n\n")
         f.write("| Метрика | Baseline (+6 дБ) | Наш Detector / Neural Cleaner | Дельта | Требование ТЗ |\n")
         f.write("|---|---|---|---|---|\n")
         f.write(f"| **Own F1** | {b_own:.4f} | **{d_own:.4f}** | **{d_own - b_own:+.4f}** | — |\n")
         f.write(f"| **Leak F1** | {b_leak:.4f} | **{d_leak:.4f}** | **{d_leak - b_leak:+.4f}** | — |\n")
         f.write(f"| **Third F1** | {b_third:.4f} | **{d_third:.4f}** | **{d_third - b_third:+.4f}** | — |\n")
         f.write(f"| **Macro F1** | {b_macro:.4f} | **{d_macro:.4f}** | **{d_macro - b_macro:+.4f}** | Выше бейзлайна |\n")
+        f.write(f"| **Leak FPR на записях без утечки** | {b_leak_fpr:.4f} | **{d_leak_fpr:.4f}** | — | Близко к 0 |\n")
         f.write(f"| **RTF Детектора (1 CPU)** | {b_rtf:.5f} | **{d_rtf:.5f}** | — | **<= 0.0667** (Запас в 5+ раз) |\n")
         f.write(f"| **RTF Клинера (1 CPU)** | — | **{c_rtf:.5f}** | — | **<= 0.0667** |\n")
         f.write(f"| **Суммарный RTF Пайплайна** | {b_rtf:.5f} | **{tot_rtf:.5f}** | — | **<= 0.0667** (Пройдено) |\n\n")
@@ -423,16 +468,38 @@ def run_evaluation(
         f.write(f"| **Метрика 2: Track Purity ПОСЛЕ clean.py (Cleaned)** | **{clean_track_pur:.4f}** | Чистота всей дорожки после клинера (+{clean_track_pur - raw_track_pur:.4f} рост чистоты речи владельца!) |\n")
         f.write(f"| **Leak Attenuation (dB)** | **{leak_atten:.2f} dB** | Подавление паразитной энергии наводки собеседника |\n\n")
 
-        f.write("### Детализация по физическим сценариям (Macro F1)\n\n")
+        f.write("### Детализация по физическим сценариям (глобальный micro Macro F1)\n\n")
         f.write("| Физический сценарий | Baseline | Detector | Дельта |\n")
         f.write("|---|---|---|---|\n")
         for sc in scenarios:
-            b_sc = np.mean(scenario_breakdown[sc]["baseline"]["macro_f1"])
-            d_sc = np.mean(scenario_breakdown[sc]["detector"]["macro_f1"])
+            b_sc = scenario_metrics[sc]["baseline"]["macro_f1"]
+            d_sc = scenario_metrics[sc]["detector"]["macro_f1"]
             f.write(f"| `{sc}` | {b_sc:.4f} | **{d_sc:.4f}** | {d_sc - b_sc:+.4f} |\n")
 
+        f.write("\n### Детализация по классам и сценариям (Detector)\n\n")
+        f.write("| Сценарий | Own F1 | Leak F1 | Third F1 |\n")
+        f.write("|---|---|---|---|\n")
+        for sc in scenarios:
+            m = scenario_metrics[sc]["detector"]["by_label"]
+            f.write(
+                f"| `{sc}` | {m['own']['f1']:.4f} | {m['leak']['f1']:.4f} | {m['third']['f1']:.4f} |\n"
+            )
+
     print(f"\nSaved Markdown report to: {output_report}")
-    return results
+    return {
+        "baseline": base_global,
+        "detector": det_global,
+        "scenarios": scenario_metrics,
+        "no_leak_leak_fpr": {"baseline": b_leak_fpr, "detector": d_leak_fpr},
+        "rtf": {"baseline": b_rtf, "detector": d_rtf, "cleaner": c_rtf, "pipeline": tot_rtf},
+        "purity": {
+            "baseline_own": b_pur,
+            "detector_own": d_own_pur,
+            "track_raw": raw_track_pur,
+            "track_clean": clean_track_pur,
+        },
+        "leak_attenuation_db": leak_atten,
+    }
 
 
 if __name__ == "__main__":

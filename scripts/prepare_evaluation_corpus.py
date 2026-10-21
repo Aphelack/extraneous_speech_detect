@@ -16,7 +16,14 @@ from src.audio_utils import save_stereo_audio
 from src.data_loader import FolderSpeechLoader
 from src.synthesizer import TelephoneDialogueSynthesizer
 
-SCENARIOS = ["normal", "double_talk", "high_leak_lt_10db", "path_drift", "third_speaker"]
+SCENARIOS = [
+    "normal",
+    "double_talk",
+    "high_leak_lt_10db",
+    "path_drift",
+    "third_speaker",
+    "no_leak",
+]
 
 
 def prepare_corpus(

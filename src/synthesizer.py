@@ -1,11 +1,14 @@
 """Telephone signal and dialogue synthesizer.
 
-Implements the physical transmission and leakage model described in the specification:
-- Dialogue between two participants (A and B) with consistent speaker_id per channel
-- Episodic third speaker (more distant/reverberant RIR, lower amplitude)
-- Leakage path h_BA:
+Implements the physical transmission and leakage model described in the
+specification:
+
+- Dialogue between two participants (A and B) with a consistent speaker per channel
+- Episodic third speaker (more distant/reverberant RIR, lower amplitude),
+  placed randomly on channel A, channel B, or both
+- Symmetric leakage paths h_BA and h_AB:
   - Acoustic coupling / RIR
-  - Delay tau in [20, 300] ms with optional drift tau(t)
+  - Delay tau in [20, 300] ms with independent drift tau(t) per direction
   - Attenuation in [6, 40] dB
   - Loudspeaker non-linearity phi (soft clipping / saturation)
 - Narrowband telephone channel T:
@@ -13,7 +16,10 @@ Implements the physical transmission and leakage model described in the specific
   - G.711 A-law companding & 8-bit quantization
   - Random 20 ms packet loss (PLC simulation)
   - Additive ambient noise n(t) at target SNR
-- Ground truth generation: exact 10 ms frame masks, interval lists, and clean owner references.
+- Ground truth is derived from the *actual audible energy* of each generated
+  component on the 10 ms grid, not from the scheduling rectangles. This makes
+  the labels automatically account for attenuation, delay drift, pauses inside
+  utterances, and the noise floor of each track.
 """
 
 import math
@@ -27,22 +33,24 @@ import scipy.signal as signal
 from src.config import (
     BANDPASS_HIGH_HZ,
     BANDPASS_LOW_HZ,
-    COLLAR_SEC,
     FRAME_DURATION_SEC,
     FRAME_SAMPLES,
     LABEL_LEAK,
     LABEL_OWN,
     LABEL_THIRD,
-    LEAK_ATTENUATION_MAX_DB,
-    LEAK_ATTENUATION_MIN_DB,
-    LEAK_DELAY_MAX_SEC,
-    LEAK_DELAY_MIN_SEC,
+    LEAK_DELAY_MAX_SAMPLES,
+    LEAK_DELAY_MIN_SAMPLES,
     PACKET_LOSS_CHUNK_SAMPLES,
     PACKET_LOSS_CHUNK_SEC,
     SAMPLE_RATE,
     SynthesisConfig,
 )
 from src.metrics import frame_mask_to_intervals
+
+# A component is considered audible in a frame when its energy exceeds the
+# local noise energy by this linear factor and is above the absolute floor.
+AUDIBILITY_NOISE_RATIO: float = 1.5
+AUDIBILITY_ABS_DBFS: float = -52.0
 
 
 def generate_synthetic_rir(
@@ -59,22 +67,17 @@ def generate_synthetic_rir(
     num_samples = int(sample_rate * length_sec)
     t = np.arange(num_samples) / sample_rate
 
-    # Reverberation decay rate: decay by 60 dB in t60_sec
-    # A(t) = exp(-6.908 * t / t60)
     decay = np.exp(-6.908 * t / max(t60_sec, 0.01))
     noise = rng.randn(num_samples).astype(np.float32)
     reverb = noise * decay
 
-    # Direct path impulse at t=0
     direct = np.zeros(num_samples, dtype=np.float32)
     direct[0] = 1.0
 
-    # Scale direct vs reverberant energy
     dr_linear = 10.0 ** (direct_to_reverberant_ratio_db / 20.0)
     reverb_norm = np.linalg.norm(reverb) + 1e-10
     rir = direct + (reverb / reverb_norm) * (1.0 / dr_linear)
 
-    # Normalize peak to 1.0
     rir = rir / (np.max(np.abs(rir)) + 1e-10)
     return rir.astype(np.float32)
 
@@ -151,7 +154,6 @@ class RIRManager:
             p = self._owner_rirs[rng.randint(len(self._owner_rirs))]
             try:
                 rir = self._load_wav_as_rir(p, max_len_sec=0.25)
-                # Boost direct path to guarantee high DRR for close-talk microphone
                 direct_idx = int(np.argmax(np.abs(rir)))
                 rir[direct_idx] = np.sign(rir[direct_idx]) * max(abs(rir[direct_idx]), 1.5)
                 return (rir / np.max(np.abs(rir))).astype(np.float32)
@@ -181,20 +183,31 @@ class RIRManager:
                 pass
         return generate_synthetic_rir(self.target_sr, t60_sec=0.22, direct_to_reverberant_ratio_db=8.0, rng=rng)
 
-    def add_realistic_noise(
+    def generate_noise(
         self,
-        x: np.ndarray,
-        snr_db: float = 25.0,
+        n_samples: int,
+        snr_db: float,
+        reference: np.ndarray,
         rng: Optional[np.random.RandomState] = None,
     ) -> np.ndarray:
+        """Generate additive noise scaled to the requested SNR w.r.t. ``reference``.
+
+        Returns the noise component alone (not the mixture), so that the
+        synthesizer can compute the true per-frame noise floor used for
+        audibility-based ground truth.
+        """
+        if rng is None:
+            rng = np.random.RandomState()
+
+        ref_power = float(np.mean(reference ** 2)) + 1e-12
+        target_noise_power = ref_power / (10.0 ** (snr_db / 10.0))
+
         if self.available and self._noise_files:
-            if rng is None:
-                rng = np.random.RandomState()
             p = self._noise_files[rng.randint(len(self._noise_files))]
             try:
                 import soundfile as sf
                 info = sf.info(str(p))
-                needed_samples = int(len(x) * (info.samplerate / self.target_sr))
+                needed_samples = int(n_samples * (info.samplerate / self.target_sr))
                 max_start = max(0, info.frames - needed_samples)
                 start_frame = rng.randint(0, max_start + 1) if max_start > 0 else 0
                 noise_slice, n_sr = sf.read(str(p), start=start_frame, frames=needed_samples)
@@ -202,21 +215,30 @@ class RIRManager:
                     noise_slice = noise_slice[:, 0]
                 if n_sr != self.target_sr:
                     noise_slice = signal.resample_poly(noise_slice, self.target_sr // 1000, n_sr // 1000)
-                if len(noise_slice) < len(x):
-                    noise_slice = np.pad(noise_slice, (0, len(x) - len(noise_slice)), mode="wrap")
+                if len(noise_slice) < n_samples:
+                    noise_slice = np.pad(noise_slice, (0, n_samples - len(noise_slice)), mode="wrap")
                 else:
-                    noise_slice = noise_slice[:len(x)]
+                    noise_slice = noise_slice[:n_samples]
 
-                # Bandpass filter noise to telephone channel
                 noise_slice = apply_bandpass_filter(noise_slice, sample_rate=self.target_sr)
-                sig_p = np.mean(x ** 2) + 1e-12
-                noise_p = np.mean(noise_slice ** 2) + 1e-12
-                target_np = sig_p / (10.0 ** (snr_db / 10.0))
-                scaled = noise_slice * np.sqrt(target_np / noise_p)
-                return (x + scaled).astype(np.float32)
+                noise_power = float(np.mean(noise_slice ** 2)) + 1e-12
+                return (noise_slice * np.sqrt(target_noise_power / noise_power)).astype(np.float32)
             except Exception:
                 pass
-        return add_colored_noise(x, snr_db=snr_db, sample_rate=self.target_sr, rng=rng)
+
+        raw_noise = rng.randn(n_samples).astype(np.float32)
+        filtered = apply_bandpass_filter(raw_noise, sample_rate=self.target_sr)
+        filtered_power = float(np.mean(filtered ** 2)) + 1e-12
+        return (filtered * np.sqrt(target_noise_power / filtered_power)).astype(np.float32)
+
+    def add_realistic_noise(
+        self,
+        x: np.ndarray,
+        snr_db: float = 25.0,
+        rng: Optional[np.random.RandomState] = None,
+    ) -> np.ndarray:
+        noise = self.generate_noise(len(x), snr_db=snr_db, reference=x, rng=rng)
+        return (x + noise).astype(np.float32)
 
 
 def apply_speaker_nonlinearity(
@@ -244,7 +266,6 @@ def apply_alaw_compression(x: np.ndarray, a_param: float = 87.6) -> np.ndarray:
     sgn_x = np.sign(flat_x)
     denom = 1.0 + np.log(a_param)
 
-    # Compression curve
     low_mask = abs_x < (1.0 / a_param)
     compressed = np.zeros_like(flat_x)
     compressed[low_mask] = (a_param * abs_x[low_mask]) / denom
@@ -253,10 +274,8 @@ def apply_alaw_compression(x: np.ndarray, a_param: float = 87.6) -> np.ndarray:
     safe_high = np.maximum(a_param * abs_x[high_mask], 1e-12)
     compressed[high_mask] = (1.0 + np.log(safe_high)) / denom
 
-    # 8-bit quantization (128 discrete magnitude levels per sign)
     quantized = np.round(compressed * 127.0) / 127.0
 
-    # Expansion curve
     expanded = np.zeros_like(flat_x)
     low_q = quantized < (1.0 / denom)
     expanded[low_q] = (quantized[low_q] * denom) / a_param
@@ -345,12 +364,41 @@ def add_colored_noise(
     noise_power = signal_power / (10.0 ** (snr_db / 10.0))
 
     raw_noise = rng.randn(len(x)).astype(np.float32)
-    # Bandlimit noise to telephone band
     filtered_noise = apply_bandpass_filter(raw_noise, sample_rate=sample_rate)
     filtered_noise_power = np.mean(filtered_noise ** 2) + 1e-12
     scaled_noise = filtered_noise * np.sqrt(noise_power / filtered_noise_power)
 
     return (x + scaled_noise).astype(np.float32)
+
+
+def frame_energy_db(x: np.ndarray, num_frames: int, hop: int = FRAME_SAMPLES) -> np.ndarray:
+    """Per-frame mean-square energy in dBFS on the 10 ms grid."""
+    needed = num_frames * hop
+    if len(x) < needed:
+        x = np.pad(x, (0, needed - len(x)), mode="constant")
+    else:
+        x = x[:needed]
+    frames = x.reshape(num_frames, hop)
+    energy = np.mean(frames.astype(np.float64) ** 2, axis=1)
+    return 10.0 * np.log10(np.maximum(energy, 1e-12))
+
+
+def audible_mask(
+    component: np.ndarray,
+    noise: np.ndarray,
+    num_frames: int,
+    hop: int = FRAME_SAMPLES,
+) -> np.ndarray:
+    """Frame mask where ``component`` is audible above ``noise``.
+
+    A frame is audible when the component energy exceeds the noise energy by
+    ``AUDIBILITY_NOISE_RATIO`` and is above ``AUDIBILITY_ABS_DBFS``.
+    """
+    comp_db = frame_energy_db(component, num_frames, hop)
+    noise_db = frame_energy_db(noise, num_frames, hop)
+    noise_energy = 10.0 ** (noise_db / 10.0)
+    comp_energy = 10.0 ** (comp_db / 10.0)
+    return (comp_energy > noise_energy * AUDIBILITY_NOISE_RATIO) & (comp_db > AUDIBILITY_ABS_DBFS)
 
 
 @dataclass
@@ -387,6 +435,9 @@ class TelephoneDialogueSynthesizer:
         self.rng = np.random.RandomState(seed)
         self.rir_manager = rir_manager or RIRManager(target_sr=self.config.sample_rate)
 
+    # ------------------------------------------------------------------
+    # Speech material
+    # ------------------------------------------------------------------
     def generate_synthetic_speech_utterance(
         self,
         duration_sec: float,
@@ -398,12 +449,10 @@ class TelephoneDialogueSynthesizer:
         num_samples = int(sr * duration_sec)
         t = np.arange(num_samples) / sr
 
-        # Glottal pulse train with slight jitter
         period = int(sr / pitch_hz)
         excitation = np.zeros(num_samples, dtype=np.float32)
         excitation[::period] = 1.0
 
-        # Formant resonators
         if formants is None:
             formants = [500.0, 1500.0, 2500.0]
 
@@ -412,7 +461,6 @@ class TelephoneDialogueSynthesizer:
             b, a = signal.iirpeak(f, Q=5.0, fs=sr)
             filtered = signal.lfilter(b, a, filtered)
 
-        # Smooth envelope (fade in / fade out)
         env = np.hanning(min(num_samples, int(sr * 0.05)))
         envelope = np.ones(num_samples, dtype=np.float32)
         n_fade = len(env) // 2
@@ -423,32 +471,143 @@ class TelephoneDialogueSynthesizer:
         max_val = np.max(np.abs(out)) + 1e-6
         return (out / max_val * 0.6).astype(np.float32)
 
+    def _get_utterance(
+        self,
+        utterance_pool: Optional[Dict[str, List[np.ndarray]]],
+        speaker: str,
+        duration_sec: float,
+    ) -> np.ndarray:
+        sr = self.config.sample_rate
+        target_len = max(1, int(sr * duration_sec))
+
+        if utterance_pool and speaker in utterance_pool and len(utterance_pool[speaker]) > 0:
+            candidates = utterance_pool[speaker]
+            utt = candidates[self.rng.randint(len(candidates))].copy()
+
+            # Speed / pitch perturbation to diversify speaker timbres.
+            if self.rng.rand() < 0.70:
+                factor = float(self.rng.uniform(0.88, 1.12))
+                num_resampled = int(round(len(utt) / factor))
+                if num_resampled > 160:
+                    utt = signal.resample(utt, num_resampled).astype(np.float32)
+
+            if len(utt) >= target_len:
+                return utt[:target_len].copy()
+            return np.pad(utt, (0, target_len - len(utt)))
+
+        pitch = 120.0 if speaker == "A" else (210.0 if speaker == "B" else 165.0)
+        return self.generate_synthetic_speech_utterance(duration_sec, pitch_hz=pitch)
+
+    # ------------------------------------------------------------------
+    # Dialogue schedule
+    # ------------------------------------------------------------------
+    def _build_schedule(self, duration_sec: float) -> List[Tuple[str, float, float]]:
+        """Random turn-taking schedule with random first speaker and interruptions.
+
+        Utterance lengths are drawn from 0.4 .. 4.5 s, pauses are short, and
+        the other participant frequently interrupts before the current turn
+        ends (creating genuine double-talk).
+        """
+        events: List[Tuple[str, float, float]] = []
+        speaker = "A" if self.rng.rand() < 0.5 else "B"
+        t = float(self.rng.uniform(0.15, 0.8))
+        limit = duration_sec - 0.25
+
+        while t < limit:
+            dur = float(self.rng.uniform(0.4, 4.5))
+            dur = min(dur, limit - t)
+            if dur < 0.3:
+                break
+            events.append((speaker, t, dur))
+            end = t + dur
+
+            other = "B" if speaker == "A" else "A"
+            if self.rng.rand() < 0.40:
+                # Interruption: the other speaker starts before this turn ends.
+                max_overlap = min(1.4, dur * 0.7)
+                overlap = float(self.rng.uniform(0.15, max_overlap)) if max_overlap > 0.15 else 0.15
+                next_start = max(t + 0.2, end - overlap)
+                speaker = other
+                t = next_start
+            else:
+                speaker = other
+                t = end + float(self.rng.uniform(0.05, 0.6))
+
+        return events
+
+    # ------------------------------------------------------------------
+    # Channel model
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _convolve_causal(x: np.ndarray, rir: np.ndarray, total_samples: int) -> np.ndarray:
+        """Causal convolution with an RIR, truncated/padded to ``total_samples``.
+
+        ``mode="same"`` would centre the impulse response and shift the signal
+        earlier in time, which corrupts the ground-truth timing. A causal
+        convolution keeps the direct path at the original sample index.
+        """
+        out = signal.fftconvolve(x, rir, mode="full")[:total_samples]
+        if len(out) < total_samples:
+            out = np.pad(out, (0, total_samples - len(out)))
+        return out.astype(np.float32)
+
+    def _transmit(self, x: np.ndarray) -> np.ndarray:
+        """Telephone transmission chain without additive noise."""
+        out = apply_bandpass_filter(x, sample_rate=self.config.sample_rate)
+        if self.config.apply_alaw:
+            out = apply_alaw_compression(out)
+        if self.config.packet_loss_prob > 0.0:
+            out = apply_packet_loss(
+                out,
+                chunk_samples=int(self.config.sample_rate * self.config.packet_loss_chunk_sec),
+                drop_prob=self.config.packet_loss_prob,
+                rng=self.rng,
+            )
+        return out
+
     def simulate_telephone_channel(
         self,
         signal_clean: np.ndarray,
         snr_db: float = 25.0,
     ) -> np.ndarray:
         """Apply telephone transmission chain T(x): Bandpass -> A-law -> Packet loss -> Noise."""
-        # 1. Bandpass 300 - 3400 Hz
-        x = apply_bandpass_filter(signal_clean, sample_rate=self.config.sample_rate)
+        x = self._transmit(signal_clean)
+        return self.rir_manager.add_realistic_noise(x, snr_db=snr_db, rng=self.rng)
 
-        # 2. G.711 A-law companding
-        if self.config.apply_alaw:
-            x = apply_alaw_compression(x)
+    def _sample_attenuation_db(self, scenario: str) -> float:
+        """Sample leak attenuation covering the full 6-40 dB range."""
+        if scenario == "high_leak_lt_10db":
+            return float(self.rng.uniform(6.0, 9.5))
+        if scenario == "path_drift":
+            return float(self.rng.uniform(8.0, 35.0))
+        if scenario == "double_talk":
+            return float(self.rng.uniform(10.0, 30.0))
+        if scenario == "third_speaker":
+            return float(self.rng.uniform(10.0, 32.0))
+        # normal / no_leak: mix of moderate and extreme attenuation so that the
+        # 9.5-15 dB and 28-40 dB bands are represented too.
+        if self.rng.rand() < 0.35:
+            return float(self.rng.uniform(6.0, 40.0))
+        return float(self.rng.uniform(12.0, 30.0))
 
-        # 3. 20 ms packet loss
-        if self.config.packet_loss_prob > 0.0:
-            x = apply_packet_loss(
-                x,
-                chunk_samples=int(self.config.sample_rate * self.config.packet_loss_chunk_sec),
-                drop_prob=self.config.packet_loss_prob,
-                rng=self.rng,
-            )
+    def _build_delay_profile(
+        self,
+        base_delay_samples: float,
+        total_samples: int,
+        drift_enabled: bool,
+    ) -> np.ndarray:
+        """Delay track in samples, clamped to the physical [20, 300] ms range."""
+        if drift_enabled:
+            drift_ms_per_sec = float(self.rng.uniform(0.5, 4.0)) * (1.0 if self.rng.rand() < 0.5 else -1.0)
+            rate = drift_ms_per_sec / 1000.0
+            profile = base_delay_samples + np.arange(total_samples, dtype=np.float64) * rate
+        else:
+            profile = np.full(total_samples, base_delay_samples, dtype=np.float64)
+        return np.clip(profile, LEAK_DELAY_MIN_SAMPLES, LEAK_DELAY_MAX_SAMPLES).astype(np.float32)
 
-        # 4. Realistic room/ambient noise
-        x = self.rir_manager.add_realistic_noise(x, snr_db=snr_db, rng=self.rng)
-        return x
-
+    # ------------------------------------------------------------------
+    # Main synthesis
+    # ------------------------------------------------------------------
     def synthesize_dialogue(
         self,
         utterance_pool: Optional[Dict[str, List[np.ndarray]]] = None,
@@ -458,236 +617,201 @@ class TelephoneDialogueSynthesizer:
         leak_attenuation_db: Optional[float] = None,
         third_speaker_prob: float = 0.5,
     ) -> SynthesisResult:
-        """Synthesize a complete two-channel dialogue with ground-truth labels.
+        """Synthesize a complete two-channel dialogue with energy-based ground truth.
 
         Scenarios:
-            - "normal": turn-taking, moderate leak (15-25 dB), low overlap
-            - "double_talk": simultaneous speech between A and B
-            - "high_leak_lt_10db": severe acoustic/electric leak (6-9 dB attenuation)
-            - "path_drift": leak delay tau drifts dynamically during call
-            - "third_speaker": third person talks near microphone A or B
+            - "normal": turn-taking, moderate leak, low overlap
+            - "double_talk": frequent simultaneous speech between A and B
+            - "high_leak_lt_10db": severe acoustic/electric leak (6-9.5 dB)
+            - "path_drift": leak delay tau drifts dynamically during the call
+            - "third_speaker": third person talks near microphone A and/or B
+            - "no_leak": no leakage at all on either track
         """
         sr = self.config.sample_rate
         total_samples = int(sr * duration_sec)
-        num_frames = int(round(duration_sec / self.config.sample_rate * sr / FRAME_DURATION_SEC))
-        total_frames = int(math.ceil(duration_sec / FRAME_DURATION_SEC))
+        total_frames = int(round(duration_sec / FRAME_DURATION_SEC))
+        hop = FRAME_SAMPLES
 
-        # 1. Parameter resolution
-        if leak_delay_sec is None:
-            leak_delay_sec = float(self.rng.uniform(*self.config.leak_delay_range_sec))
-
-        if leak_attenuation_db is None:
-            if scenario == "high_leak_lt_10db":
-                leak_attenuation_db = float(self.rng.uniform(6.0, 9.5))
-            else:
-                leak_attenuation_db = float(self.rng.uniform(15.0, 28.0))
-
-        # 2. Turn schedule generation
+        # 1. Turn schedule and clean timelines.
         timeline_a = np.zeros(total_samples, dtype=np.float32)
         timeline_b = np.zeros(total_samples, dtype=np.float32)
         timeline_3 = np.zeros(total_samples, dtype=np.float32)
 
-        gt_intervals: Dict[str, List[Dict[str, Any]]] = {"A": [], "B": []}
+        for speaker, start_sec, dur_sec in self._build_schedule(duration_sec):
+            s_idx = int(start_sec * sr)
+            e_idx = min(total_samples, s_idx + int(dur_sec * sr))
+            if e_idx <= s_idx:
+                continue
+            utt = self._get_utterance(utterance_pool, speaker, (e_idx - s_idx) / sr)
+            seg_len = min(len(utt), e_idx - s_idx)
+            target = timeline_a if speaker == "A" else timeline_b
+            target[s_idx : s_idx + seg_len] += utt[:seg_len]
 
-        # Helper to get or synthesize an utterance
-        def get_utterance(spk: str, dur: float) -> np.ndarray:
-            if utterance_pool and spk in utterance_pool and len(utterance_pool[spk]) > 0:
-                candidates = utterance_pool[spk]
-                utt = candidates[self.rng.randint(len(candidates))].copy()
-
-                # Speed / pitch perturbation to diversify Russian speaker timbres.
-                if self.rng.rand() < 0.70:
-                    factor = float(self.rng.uniform(0.88, 1.12))
-                    num_resampled = int(round(len(utt) / factor))
-                    if num_resampled > 160:
-                        utt = signal.resample(utt, num_resampled).astype(np.float32)
-
-                target_len = int(sr * dur)
-                if len(utt) >= target_len:
-                    return utt[:target_len].copy()
-                else:
-                    return np.pad(utt, (0, target_len - len(utt)))
-            # Default synthetic vowel excitation
-            pitch = 120.0 if spk == "A" else (210.0 if spk == "B" else 165.0)
-            return self.generate_synthetic_speech_utterance(dur, pitch_hz=pitch)
-
-        # Build turn-taking schedule
-        curr_time = 0.5  # initial quiet pause
-        while curr_time < (duration_sec - 1.5):
-            dur_a = float(self.rng.uniform(1.2, 2.5))
-            if curr_time + dur_a > duration_sec - 0.5:
-                dur_a = max(0.5, duration_sec - 0.5 - curr_time)
-
-            # Speaker A turn
-            s_idx = int(curr_time * sr)
-            e_idx = min(total_samples, s_idx + int(dur_a * sr))
-            actual_dur = (e_idx - s_idx) / sr
-
-            utt_a = get_utterance("A", actual_dur)
-            seg_len_a = min(len(utt_a), e_idx - s_idx)
-            timeline_a[s_idx : s_idx + seg_len_a] += utt_a[:seg_len_a]
-
-            start_a_sec = round(curr_time, 4)
-            end_a_sec = round(curr_time + actual_dur, 4)
-            gt_intervals["A"].append({"start": start_a_sec, "end": end_a_sec, "label": LABEL_OWN, "score": 1.0})
-
-            # Transition to B
-            if scenario == "double_talk":
-                # Significant overlap: B interrupts A before A finishes
-                overlap = float(self.rng.uniform(0.6, 1.4))
-                curr_time = max(0.2, curr_time + actual_dur - overlap)
-            else:
-                pause = float(self.rng.uniform(0.3, 0.8))
-                curr_time = curr_time + actual_dur + pause
-
-            if curr_time >= (duration_sec - 1.0):
-                break
-
-            # Speaker B turn
-            dur_b = float(self.rng.uniform(1.2, 2.5))
-            if curr_time + dur_b > duration_sec - 0.5:
-                dur_b = max(0.5, duration_sec - 0.5 - curr_time)
-
-            s_idx_b = int(curr_time * sr)
-            e_idx_b = min(total_samples, s_idx_b + int(dur_b * sr))
-            actual_dur_b = (e_idx_b - s_idx_b) / sr
-
-            utt_b = get_utterance("B", actual_dur_b)
-            seg_len_b = min(len(utt_b), e_idx_b - s_idx_b)
-            timeline_b[s_idx_b : s_idx_b + seg_len_b] += utt_b[:seg_len_b]
-
-            start_b_sec = round(curr_time, 4)
-            end_b_sec = round(curr_time + actual_dur_b, 4)
-            gt_intervals["B"].append({"start": start_b_sec, "end": end_b_sec, "label": LABEL_OWN, "score": 1.0})
-
-            if scenario == "double_talk":
-                overlap = float(self.rng.uniform(0.5, 1.2))
-                curr_time = max(0.2, curr_time + actual_dur_b - overlap)
-            else:
-                pause = float(self.rng.uniform(0.3, 0.8))
-                curr_time = curr_time + actual_dur_b + pause
-
-        # Add Third Speaker (if requested or in third_speaker scenario)
+        # 2. Third speaker: random channel(s), random attenuation 3-15 dB.
         has_third = (scenario == "third_speaker") or (self.rng.rand() < third_speaker_prob)
-        if has_third and duration_sec > 4.0:
-            start_third_sec = float(self.rng.uniform(1.5, max(2.0, duration_sec - 3.0)))
-            dur_third = float(self.rng.uniform(1.0, 2.2))
-            s_idx_3 = int(start_third_sec * sr)
-            e_idx_3 = min(total_samples, s_idx_3 + int(dur_third * sr))
-            actual_dur_3 = (e_idx_3 - s_idx_3) / sr
+        third_channels: List[str] = []
+        third_segments: List[Tuple[str, float, float]] = []
+        if has_third and duration_sec > 3.0:
+            if scenario == "third_speaker":
+                third_channels = [str(self.rng.choice(["A", "B"]))]
+                if self.rng.rand() < 0.35:
+                    third_channels.append("B" if third_channels[0] == "A" else "A")
+            else:
+                third_channels = [str(self.rng.choice(["A", "B"]))]
 
-            utt_3 = get_utterance("third", actual_dur_3)
-            seg_len_3 = min(len(utt_3), e_idx_3 - s_idx_3)
-            timeline_3[s_idx_3 : s_idx_3 + seg_len_3] += utt_3[:seg_len_3]
+            for ch in third_channels:
+                start_third = float(self.rng.uniform(0.8, max(1.0, duration_sec - 2.0)))
+                dur_third = float(self.rng.uniform(0.6, 2.5))
+                s_idx = int(start_third * sr)
+                e_idx = min(total_samples, s_idx + int(dur_third * sr))
+                if e_idx <= s_idx:
+                    continue
+                utt = self._get_utterance(utterance_pool, "third", (e_idx - s_idx) / sr)
+                seg_len = min(len(utt), e_idx - s_idx)
+                timeline_3[s_idx : s_idx + seg_len] += utt[:seg_len]
+                third_segments.append((ch, start_third, (e_idx - s_idx) / sr))
 
-            # Third speaker talks near Track A
-            gt_intervals["A"].append({
-                "start": round(start_third_sec, 4),
-                "end": round(start_third_sec + actual_dur_3, 4),
-                "label": LABEL_THIRD,
-                "score": 1.0,
-            })
-
-        # Keep pure references s_A, s_B
         clean_s_a = timeline_a.copy()
         clean_s_b = timeline_b.copy()
 
-        # 3. Acoustic modeling: RIR convolution
-        # Room response for owner A & B (high DRR, close-talk mic)
+        # 3. Acoustic modeling: RIR convolution.
         rir_owner_a = self.rir_manager.get_owner_rir(rng=self.rng)
         rir_owner_b = self.rir_manager.get_owner_rir(rng=self.rng)
-        rec_a = signal.fftconvolve(timeline_a, rir_owner_a, mode="same")
-        rec_b = signal.fftconvolve(timeline_b, rir_owner_b, mode="same")
+        rec_a = self._convolve_causal(timeline_a, rir_owner_a, total_samples)
+        rec_b = self._convolve_causal(timeline_b, rir_owner_b, total_samples)
 
-        # Third speaker RIR: more distant and reverberant (real office / conference room)
-        rir_third = self.rir_manager.get_third_speaker_rir(rng=self.rng)
-        rec_third = signal.fftconvolve(timeline_3, rir_third, mode="same")
-        # Attenuate third speaker relative to owner
-        third_gain = 10.0 ** (-self.config.third_speaker_attenuation_db / 20.0)
-        rec_third = rec_third * third_gain
+        # Third speaker: independent distant RIR per channel, 3-15 dB below owner.
+        rec_third_a = np.zeros(total_samples, dtype=np.float32)
+        rec_third_b = np.zeros(total_samples, dtype=np.float32)
+        third_gains: Dict[str, float] = {}
+        for ch in third_channels:
+            rir_third = self.rir_manager.get_third_speaker_rir(rng=self.rng)
+            rec_third = self._convolve_causal(timeline_3, rir_third, total_samples)
+            atten_db = float(self.rng.uniform(3.0, 15.0))
+            third_gains[ch] = atten_db
+            rec_third = rec_third * (10.0 ** (-atten_db / 20.0))
+            if ch == "A":
+                rec_third_a = rec_third
+            else:
+                rec_third_b = rec_third
 
-        # 4. Leakage modeling: Speaker B leaks into Track A (and vice-versa)
-        rir_leak = self.rir_manager.get_leakage_rir(rng=self.rng)
-
-        # Speaker saturation nonlinearity on counterpart signal
-        sig_b_speaker = apply_speaker_nonlinearity(rec_b, saturation_factor=1.8)
-        sig_b_coupled = signal.fftconvolve(sig_b_speaker, rir_leak, mode="same")
-
-        # Delay & drift calculation for B -> A leak
-        base_delay_samples = leak_delay_sec * sr
-        if scenario == "path_drift" or self.config.apply_drift:
-            # Linear drift: e.g. +2 ms per second
-            drift_rate_samples_per_sample = (self.config.drift_speed_ms_per_sec / 1000.0)
-            delay_profile = base_delay_samples + np.arange(total_samples) * drift_rate_samples_per_sample
+        # 4. Symmetric leakage paths B -> A and A -> B.
+        if scenario == "no_leak":
+            leak_a_enabled = False
+            leak_b_enabled = False
         else:
-            delay_profile = np.full(total_samples, base_delay_samples, dtype=np.float32)
+            leak_a_enabled = True
+            leak_b_enabled = True
+            # 20% of records have no leak on one or both tracks.
+            if self.rng.rand() < 0.20:
+                mode = str(self.rng.choice(["A", "B", "both"]))
+                if mode in ("A", "both"):
+                    leak_a_enabled = False
+                if mode in ("B", "both"):
+                    leak_b_enabled = False
 
-        leak_b_to_a = apply_time_varying_delay(sig_b_coupled, delay_profile)
+        if leak_delay_sec is None:
+            leak_delay_sec = float(self.rng.uniform(*self.config.leak_delay_range_sec))
+        if leak_attenuation_db is None:
+            leak_attenuation_db = self._sample_attenuation_db(scenario)
 
-        # Attenuation of leak
-        leak_scale = 10.0 ** (-leak_attenuation_db / 20.0)
-        leak_b_to_a = leak_b_to_a * leak_scale
+        drift_prob = 0.75 if scenario == "path_drift" else 0.25
 
-        # Build ground truth leak intervals on Track A
-        # For each segment of B, shift by tau
-        for seg_b in [s for s in gt_intervals["B"] if s["label"] == LABEL_OWN]:
-            leak_start = round(seg_b["start"] + leak_delay_sec, 4)
-            leak_end = round(seg_b["end"] + leak_delay_sec, 4)
-            if leak_start < duration_sec:
-                gt_intervals["A"].append({
-                    "start": leak_start,
-                    "end": min(round(duration_sec, 4), leak_end),
-                    "label": LABEL_LEAK,
-                    "score": 1.0,
-                })
+        leak_b_to_a = np.zeros(total_samples, dtype=np.float32)
+        leak_a_to_b = np.zeros(total_samples, dtype=np.float32)
+        leak_delay_a = leak_delay_sec
+        leak_delay_b = leak_delay_sec
+        leak_atten_a = leak_attenuation_db
+        leak_atten_b = leak_attenuation_db
 
-        # Mirror leak: A leaks into Track B (with moderate 20 dB attenuation)
-        sig_a_speaker = apply_speaker_nonlinearity(rec_a, saturation_factor=1.5)
-        sig_a_coupled = signal.fftconvolve(sig_a_speaker, rir_leak, mode="same")
-        delay_a_to_b = np.full(total_samples, 0.040 * sr, dtype=np.float32)
-        leak_a_to_b = apply_time_varying_delay(sig_a_coupled, delay_a_to_b) * (10.0 ** (-20.0 / 20.0))
+        if leak_a_enabled:
+            rir_leak_ba = self.rir_manager.get_leakage_rir(rng=self.rng)
+            sig_b_speaker = apply_speaker_nonlinearity(rec_b, saturation_factor=1.8)
+            sig_b_coupled = self._convolve_causal(sig_b_speaker, rir_leak_ba, total_samples)
+            delay_profile = self._build_delay_profile(
+                leak_delay_sec * sr, total_samples, drift_enabled=self.rng.rand() < drift_prob
+            )
+            leak_b_to_a = apply_time_varying_delay(sig_b_coupled, delay_profile)
+            leak_b_to_a = leak_b_to_a * (10.0 ** (-leak_attenuation_db / 20.0))
 
-        for seg_a in [s for s in gt_intervals["A"] if s["label"] == LABEL_OWN]:
-            l_start = round(seg_a["start"] + 0.040, 4)
-            l_end = round(seg_a["end"] + 0.040, 4)
-            if l_start < duration_sec:
-                gt_intervals["B"].append({
-                    "start": l_start,
-                    "end": min(round(duration_sec, 4), l_end),
-                    "label": LABEL_LEAK,
-                    "score": 1.0,
-                })
+        if leak_b_enabled:
+            rir_leak_ab = self.rir_manager.get_leakage_rir(rng=self.rng)
+            sig_a_speaker = apply_speaker_nonlinearity(rec_a, saturation_factor=1.5)
+            sig_a_coupled = self._convolve_causal(sig_a_speaker, rir_leak_ab, total_samples)
+            # Independent delay and attenuation for the opposite direction.
+            leak_delay_b = float(self.rng.uniform(*self.config.leak_delay_range_sec))
+            leak_atten_b = self._sample_attenuation_db(scenario)
+            delay_profile_b = self._build_delay_profile(
+                leak_delay_b * sr, total_samples, drift_enabled=self.rng.rand() < drift_prob
+            )
+            leak_a_to_b = apply_time_varying_delay(sig_a_coupled, delay_profile_b)
+            leak_a_to_b = leak_a_to_b * (10.0 ** (-leak_atten_b / 20.0))
 
-        # 5. Acoustic summation at microphone:
-        # Track A mic: own speech rec_a + leak_b_to_a + rec_third
-        # Track B mic: own speech rec_b + leak_a_to_b
-        mic_a = rec_a + leak_b_to_a + rec_third
-        mic_b = rec_b + leak_a_to_b
+        # 5. Acoustic summation at each microphone.
+        mic_a = rec_a + leak_b_to_a + rec_third_a
+        mic_b = rec_b + leak_a_to_b + rec_third_b
 
-        # 6. Telephone narrowband transmission channel T
-        snr = float(self.rng.uniform(*self.config.snr_db_range))
-        track_a = self.simulate_telephone_channel(mic_a, snr_db=snr)
-        track_b = self.simulate_telephone_channel(mic_b, snr_db=snr)
+        # 6. Telephone transmission + independent noise per track.
+        snr_a = float(self.rng.uniform(*self.config.snr_db_range))
+        snr_b = float(self.rng.uniform(*self.config.snr_db_range))
 
+        tx_a = self._transmit(mic_a)
+        tx_b = self._transmit(mic_b)
+        noise_a = self.rir_manager.generate_noise(total_samples, snr_db=snr_a, reference=tx_a, rng=self.rng)
+        noise_b = self.rir_manager.generate_noise(total_samples, snr_db=snr_b, reference=tx_b, rng=self.rng)
+
+        track_a = (tx_a + noise_a).astype(np.float32)
+        track_b = (tx_b + noise_b).astype(np.float32)
         stereo = np.stack([track_a, track_b], axis=0).astype(np.float32)
 
-        # Sort all ground truth intervals by start time
-        gt_intervals["A"].sort(key=lambda x: x["start"])
-        gt_intervals["B"].sort(key=lambda x: x["start"])
+        # 7. Ground truth from the actual audible energy of each component.
+        # Components are band-limited to the telephone band so their levels are
+        # directly comparable with the additive noise floor of the track.
+        comp_own_a = apply_bandpass_filter(rec_a, sample_rate=sr)
+        comp_own_b = apply_bandpass_filter(rec_b, sample_rate=sr)
+        comp_leak_ba = apply_bandpass_filter(leak_b_to_a, sample_rate=sr)
+        comp_leak_ab = apply_bandpass_filter(leak_a_to_b, sample_rate=sr)
+        comp_third_a = apply_bandpass_filter(rec_third_a, sample_rate=sr)
+        comp_third_b = apply_bandpass_filter(rec_third_b, sample_rate=sr)
+
+        masks_a = {
+            LABEL_OWN: audible_mask(comp_own_a, noise_a, total_frames, hop),
+            LABEL_LEAK: audible_mask(comp_leak_ba, noise_a, total_frames, hop),
+            LABEL_THIRD: audible_mask(comp_third_a, noise_a, total_frames, hop),
+        }
+        masks_b = {
+            LABEL_OWN: audible_mask(comp_own_b, noise_b, total_frames, hop),
+            LABEL_LEAK: audible_mask(comp_leak_ab, noise_b, total_frames, hop),
+            LABEL_THIRD: audible_mask(comp_third_b, noise_b, total_frames, hop),
+        }
+
+        gt_intervals: Dict[str, List[Dict[str, Any]]] = {"A": [], "B": []}
+        for ch, masks in (("A", masks_a), ("B", masks_b)):
+            for label, mask in masks.items():
+                gt_intervals[ch].extend(
+                    frame_mask_to_intervals(mask, label=label, frame_sec=FRAME_DURATION_SEC)
+                )
+            gt_intervals[ch].sort(key=lambda x: (x["start"], x["label"]))
+
+        # 8. Cleaner targets: track minus the band-limited leak component.
+        target_a = (track_a - comp_leak_ba).astype(np.float32)
+        target_b = (track_b - comp_leak_ab).astype(np.float32)
 
         metadata = {
             "scenario": scenario,
-            "leak_delay_sec": leak_delay_sec,
-            "leak_attenuation_db": leak_attenuation_db,
-            "snr_db": snr,
+            "leak_delay_sec": leak_delay_a,
+            "leak_delay_b_sec": leak_delay_b,
+            "leak_attenuation_db": leak_atten_a,
+            "leak_attenuation_b_db": leak_atten_b,
+            "leak_enabled_a": leak_a_enabled,
+            "leak_enabled_b": leak_b_enabled,
+            "snr_db": snr_a,
+            "snr_b_db": snr_b,
             "has_third_speaker": has_third,
+            "third_channels": third_channels,
+            "third_attenuation_db": third_gains,
             "duration_sec": duration_sec,
         }
-
-        leak_filt_a = apply_bandpass_filter(leak_b_to_a, sample_rate=sr)
-        leak_filt_b = apply_bandpass_filter(leak_a_to_b, sample_rate=sr)
-        target_a = (track_a - leak_filt_a).astype(np.float32)
-        target_b = (track_b - leak_filt_b).astype(np.float32)
 
         return SynthesisResult(
             audio=stereo,

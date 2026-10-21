@@ -41,6 +41,11 @@ class _CleanerNet(nn.Module):
 
     def __init__(self, in_channels: int = 164, hidden_dim: int = 48, num_bands: int = 32):
         super().__init__()
+        self.in_channels = in_channels
+        # Feature standardization statistics are part of the state_dict so the
+        # checkpoint can be loaded with torch.load(..., weights_only=True).
+        self.register_buffer("feat_mean", torch.zeros(1, in_channels, 1))
+        self.register_buffer("feat_std", torch.ones(1, in_channels, 1))
         self.in_proj = nn.Sequential(
             nn.Conv1d(in_channels, hidden_dim, 1),
             nn.GroupNorm(4, hidden_dim),
@@ -60,6 +65,7 @@ class _CleanerNet(nn.Module):
         squeezed = x.ndim == 2
         if squeezed:
             x = x.unsqueeze(0)
+        x = (x - self.feat_mean) / self.feat_std
         hidden = self.in_proj(x)
         for block in self.blocks:
             hidden = hidden + block(hidden)
@@ -92,24 +98,21 @@ class TelephoneAudioCleaner:
 
     def _load_model(self) -> None:
         self.model = None
-        self.mean = None
-        self.std = None
         path = Path(self.config.weights_path)
         if not path.exists():
             path = Path(__file__).resolve().parent.parent / self.config.weights_path
         if not path.exists():
             return
         try:
-            checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
-            state = checkpoint.get("model_state_dict", checkpoint)
-            in_channels = int(checkpoint.get("in_channels", 164)) if isinstance(checkpoint, dict) else 164
-            num_bands = int(checkpoint.get("num_bands", self.config.num_bands)) if isinstance(checkpoint, dict) else self.config.num_bands
+            # weights_only=True: only tensors / primitives are stored.
+            checkpoint = torch.load(str(path), map_location="cpu", weights_only=True)
+            state = checkpoint["model_state_dict"]
+            in_channels = int(state["in_proj.0.weight"].shape[1])
+            num_bands = int(state["head.0.weight"].shape[0])
             model = _CleanerNet(in_channels=in_channels, hidden_dim=48, num_bands=num_bands)
             model.load_state_dict(state)
             model.eval()
             self.model = model
-            self.mean = checkpoint.get("mean") if isinstance(checkpoint, dict) else None
-            self.std = checkpoint.get("std") if isinstance(checkpoint, dict) else None
         except Exception as exc:
             print(f"Notice: Cleaner weights could not be loaded ({exc}); analytic mask enabled.")
 
@@ -217,12 +220,10 @@ class TelephoneAudioCleaner:
         p_third = np.resize(np.asarray(prob_third, dtype=np.float32), frames)
         leak_estimate = self._estimate_leakage(mag_a, np.abs(aligned_b), p_own, p_leak)
         features = self.extract_features(Za, Zb, p_own, p_leak, p_third, aligned_b, leak_estimate)
-        if self.model is not None and self.model.in_proj[0].in_channels == features.shape[0]:
-            model_features = features
-            if self.mean is not None and self.std is not None:
-                model_features = (model_features - np.asarray(self.mean)) / (np.asarray(self.std) + 1e-6)
+        if self.model is not None and self.model.in_channels == features.shape[0]:
+            # Standardization is applied inside the network via buffers.
             with torch.no_grad():
-                bands = self.model(torch.tensor(model_features, dtype=torch.float32)).numpy()
+                bands = self.model(torch.tensor(features, dtype=torch.float32)).numpy()
         else:
             band_a = self.filterbank @ mag_a
             band_leak = self.filterbank @ leak_estimate
@@ -271,10 +272,24 @@ class TelephoneAudioCleaner:
         _, cleaned = signal.istft(cleaned_spec, fs=sample_rate, window=window, nperseg=n_fft, noverlap=n_fft - hop)
         return cleaned[:n_samples].astype(np.float32), gain.astype(np.float32)
 
-    def clean_stereo(self, audio: np.ndarray, sample_rate: int = SAMPLE_RATE, return_masks: bool = False) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, np.ndarray]]]:
+    def clean_stereo(
+        self,
+        audio: np.ndarray,
+        sample_rate: int = SAMPLE_RATE,
+        return_masks: bool = False,
+        probabilities: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, np.ndarray]]]:
+        """Clean both tracks.
+
+        ``probabilities`` may be supplied when the caller has already run the
+        detector (e.g. ``evaluate.py``), which avoids computing the feature
+        matrix twice and keeps the pipeline within the RTF budget.
+        """
         if audio.ndim != 2 or audio.shape[0] != 2:
             raise ValueError(f"Expected shape (2, N), got {audio.shape}")
-        probs = self.detector.predict_probabilities(audio, sample_rate=sample_rate)
+        probs = probabilities if probabilities is not None else self.detector.predict_probabilities(
+            audio, sample_rate=sample_rate
+        )
         clean_a, mask_a = self._apply_cleaner_mask(audio[0], audio[1], probs["A"]["own"], probs["A"]["leak"], probs["A"]["third"], sample_rate)
         clean_b, mask_b = self._apply_cleaner_mask(audio[1], audio[0], probs["B"]["own"], probs["B"]["leak"], probs["B"]["third"], sample_rate)
         cleaned = np.stack([clean_a, clean_b]).astype(np.float32)
@@ -287,8 +302,16 @@ class TelephoneAudioCleaner:
         if preview_wav:
             save_stereo_audio(preview_wav, resample_audio(cleaned, orig_sr=sr, target_sr=preview_sr), sample_rate=preview_sr)
 
-    def clean(self, audio: np.ndarray, predictions: Optional[Any] = None, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-        return self.clean_stereo(audio, sample_rate=sample_rate)
+    def clean(
+        self,
+        audio: np.ndarray,
+        predictions: Optional[Any] = None,
+        sample_rate: int = SAMPLE_RATE,
+        probabilities: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
+    ) -> np.ndarray:
+        return self.clean_stereo(
+            audio, sample_rate=sample_rate, probabilities=probabilities
+        )
 
 
 def compute_spectral_embedding(signal_1d: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:

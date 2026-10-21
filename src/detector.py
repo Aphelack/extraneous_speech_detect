@@ -27,7 +27,7 @@ from src.config import (
     LABEL_THIRD,
     SAMPLE_RATE,
 )
-from src.features import FeatureExtractor
+from src.features import FEATURE_INDEX, FeatureExtractor
 from src.metrics import frame_mask_to_intervals
 
 
@@ -59,6 +59,10 @@ class _DetectorNet(nn.Module):
     def __init__(self, in_features: int = 36, hidden_dim: int = 48, num_classes: int = 3):
         super().__init__()
         self.in_features = in_features
+        # Feature standardization statistics live inside the state_dict so that
+        # checkpoints can be loaded with torch.load(..., weights_only=True).
+        self.register_buffer("feat_mean", torch.zeros(1, in_features, 1))
+        self.register_buffer("feat_std", torch.ones(1, in_features, 1))
         self.in_proj = nn.Sequential(
             nn.Conv1d(in_features, hidden_dim, kernel_size=1),
             nn.GroupNorm(4, hidden_dim),
@@ -80,6 +84,9 @@ class _DetectorNet(nn.Module):
         elif x.ndim == 3 and x.shape[1] != self.in_features and x.shape[2] == self.in_features:
             # (B, T, C) -> (B, C, T)
             x = x.transpose(1, 2)
+
+        # Standardize with the buffers stored in the checkpoint.
+        x = (x - self.feat_mean) / self.feat_std
 
         h = self.in_proj(x)
         for blk in self.blocks:
@@ -119,8 +126,6 @@ class ExtraneousSpeechDetector:
 
     def _load_model(self) -> None:
         self.model = None
-        self.mean = None
-        self.std = None
 
         weights_file = Path(self.config.weights_path)
         if not weights_file.exists():
@@ -137,14 +142,15 @@ class ExtraneousSpeechDetector:
 
         if weights_file.exists():
             try:
-                ckpt = torch.load(weights_file, map_location="cpu", weights_only=False)
-                in_dim = len(ckpt["mean"].flatten())
+                # weights_only=True: the checkpoint contains only tensors and
+                # primitive metadata, so no arbitrary pickle code is executed.
+                ckpt = torch.load(weights_file, map_location="cpu", weights_only=True)
+                state = ckpt["model_state_dict"]
+                in_dim = int(state["in_proj.0.weight"].shape[1])
                 model = _DetectorNet(in_features=in_dim, hidden_dim=48, num_classes=3)
-                model.load_state_dict(ckpt["model_state_dict"])
+                model.load_state_dict(state)
                 model.eval()
                 self.model = model
-                self.mean = ckpt["mean"]
-                self.std = ckpt["std"]
             except Exception as e:
                 print(f"Warning: could not load {weights_file} ({e}), falling back to heuristic detector.")
 
@@ -184,18 +190,19 @@ class ExtraneousSpeechDetector:
                 probs[ch] = {LABEL_OWN: np.array([]), LABEL_LEAK: np.array([]), LABEL_THIRD: np.array([])}
                 continue
 
-            db_energy = ch_feats[:, 0]
-            ild = ch_feats[:, 1]
-            gcc_peak = ch_feats[:, 3]
-            anchor_cos_dist = ch_feats[:, 33]
+            db_energy = ch_feats[:, FEATURE_INDEX["db_energy"]]
+            ild = ch_feats[:, FEATURE_INDEX["ild"]]
+            gcc_peak = ch_feats[:, FEATURE_INDEX["gcc_peak"]]
+            anchor_cos_dist = ch_feats[:, FEATURE_INDEX["anchor_cos_dist"]]
+            snr_local = ch_feats[:, FEATURE_INDEX["snr_local_db"]]
+            coherence = ch_feats[:, FEATURE_INDEX["coherence"]]
+            leak_audible = ch_feats[:, FEATURE_INDEX["leak_audible"]]
             vad_mask = self._estimate_vad_mask(db_energy)
-            x_full = ch_feats
 
             if self.model is not None:
-                # Standardize
-                x_norm = (x_full - self.mean) / self.std
+                # Standardization is applied inside the network via buffers.
                 with torch.no_grad():
-                    t_x = torch.tensor(x_norm, dtype=torch.float32)
+                    t_x = torch.tensor(ch_feats, dtype=torch.float32)
                     logits = self.model(t_x)
                     preds = torch.sigmoid(logits).cpu().numpy()
 
@@ -210,21 +217,44 @@ class ExtraneousSpeechDetector:
                 p_third = np.where(silence_floor, 0.0, p_third)
             else:
                 # Calibrated physical heuristic fallback
-                other_vad = self._estimate_vad_mask(other_feats[:, 0])
+                other_vad = self._estimate_vad_mask(other_feats[:, FEATURE_INDEX["db_energy"]])
 
                 p_leak = np.where(vad_mask & other_vad & (ild < 7.0), 0.85, 0.0)
                 p_own = np.where(vad_mask & (ild > -7.0), 0.90, 0.0)
                 p_third = np.where(
-                    vad_mask & (~other_vad) & (ch_feats[:, 6] < 0.65) & (anchor_cos_dist > 0.35),
+                    vad_mask
+                    & (~other_vad)
+                    & (ch_feats[:, FEATURE_INDEX["hl_ratio"]] < 0.65)
+                    & (anchor_cos_dist > 0.35),
                     0.85,
                     0.0,
                 )
 
-            # A third speaker is local to this channel: cross-channel evidence
-            # or a close owner-anchor match is incompatible with that label.
+            # Physical gate: a leak can only be heard if the local channel is
+            # above its own noise floor AND there is at least some cross-channel
+            # evidence (coherence or a GCC peak at a plausible delay). This
+            # prevents "leak=1" on frames where the local channel contains only
+            # background noise while the counterpart happens to be talking.
+            no_local_energy = snr_local < 3.0
+            no_cross_evidence = (coherence < 0.10) & (gcc_peak < 0.10)
+            p_leak = np.where(no_local_energy | no_cross_evidence, 0.0, p_leak)
+
+            # A third speaker is local to this channel: strong cross-channel
+            # leak evidence or a close owner-anchor match is incompatible with
+            # that label. The explicit third_score feature provides the
+            # positive evidence (non-owner, non-leak, distant timbre).
+            third_score = ch_feats[:, FEATURE_INDEX["third_score"]]
             third_is_remote = (p_leak > 0.65) & (gcc_peak > 0.45)
             third_is_owner = (ild > 8.0) & (anchor_cos_dist < 0.25)
             p_third = np.where(third_is_remote | third_is_owner, 0.0, p_third)
+
+            # Physical gating of the third-speaker head. The network alone
+            # over-predicts `third` on ordinary owner speech, so a `third`
+            # frame additionally requires physical evidence of a distant,
+            # non-owner talker (third_score). Frames without that evidence are
+            # suppressed entirely.
+            third_evidence = third_score >= 0.30
+            p_third = np.where(third_evidence, p_third, 0.0)
 
             # Temporal median filtering (50 ms)
             k = self.config.smoothing_window_frames
@@ -245,9 +275,16 @@ class ExtraneousSpeechDetector:
         self,
         audio: np.ndarray,
         sample_rate: int = SAMPLE_RATE,
+        probabilities: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """Produce interval predictions compliant with project JSON schema."""
-        probs = self.predict_probabilities(audio, sample_rate=sample_rate)
+        """Produce interval predictions compliant with project JSON schema.
+
+        ``probabilities`` may be supplied to reuse an already computed feature
+        matrix / network pass.
+        """
+        probs = probabilities if probabilities is not None else self.predict_probabilities(
+            audio, sample_rate=sample_rate
+        )
         results: Dict[str, List[Dict[str, Any]]] = {"A": [], "B": []}
 
         for ch in ("A", "B"):

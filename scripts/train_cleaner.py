@@ -34,7 +34,7 @@ def train_cleaner(
     cleaner = TelephoneAudioCleaner(detector=detector)
     config = CleanerConfig()
     window = signal.windows.hann(config.n_fft)
-    scenarios = ["normal", "double_talk", "high_leak_lt_10db", "path_drift", "third_speaker"]
+    scenarios = ["normal", "double_talk", "high_leak_lt_10db", "path_drift", "third_speaker", "no_leak"]
 
     features: List[np.ndarray] = []
     inputs: List[np.ndarray] = []
@@ -43,7 +43,7 @@ def train_cleaner(
 
     for scenario in scenarios:
         for _ in range(dialogues_per_scenario):
-            sa, sb, st = loader.sample_dialogue_speakers("train", russian_prob=0.80, rng=rng)
+            sa, sb, st = loader.sample_dialogue_speakers("train", russian_prob=0.25, rng=rng)
             pool = loader.build_utterance_pool(sa, sb, st, max_per_speaker=8)
             result = synth.synthesize_dialogue(
                 utterance_pool=pool,
@@ -81,9 +81,11 @@ def train_cleaner(
     mean = np.mean(all_features, axis=1, keepdims=True)
     std = np.std(all_features, axis=1, keepdims=True) + 1e-6
     bank = torch.tensor(cleaner.filterbank.T, dtype=torch.float32)
+    # Raw (unstandardized) features: standardization happens inside the model
+    # via feat_mean / feat_std buffers stored in the state_dict.
     dataset = [
         (
-            torch.tensor((x - mean) / std, dtype=torch.float32),
+            torch.tensor(x, dtype=torch.float32),
             torch.tensor(input_mag, dtype=torch.float32),
             torch.tensor(target_mag, dtype=torch.float32),
             torch.tensor(weight, dtype=torch.float32),
@@ -92,6 +94,9 @@ def train_cleaner(
     ]
 
     model = _CleanerNet(in_channels=all_features.shape[0], hidden_dim=48, num_bands=config.num_bands)
+    with torch.no_grad():
+        model.feat_mean.copy_(torch.tensor(mean.reshape(1, -1, 1), dtype=torch.float32))
+        model.feat_std.copy_(torch.tensor(std.reshape(1, -1, 1), dtype=torch.float32))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     model.train()
@@ -116,12 +121,11 @@ def train_cleaner(
 
     output = Path(weights_path)
     output.parent.mkdir(parents=True, exist_ok=True)
+    # Only tensors and primitive metadata -> safe weights_only=True loading.
     torch.save({
         "model_state_dict": model.state_dict(),
-        "mean": mean,
-        "std": std,
-        "in_channels": all_features.shape[0],
-        "num_bands": config.num_bands,
+        "in_channels": int(all_features.shape[0]),
+        "num_bands": int(config.num_bands),
         "hidden_dim": 48,
         "architecture": "delay-aligned-irm-tcn",
     }, output)

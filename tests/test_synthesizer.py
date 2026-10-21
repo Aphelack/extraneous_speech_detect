@@ -86,12 +86,101 @@ def test_synthesizer_generates_dialogue_and_valid_ground_truth():
 def test_synthesizer_all_hard_scenarios():
     """Verify all designated hard scenarios synthesize without errors."""
     synth = TelephoneDialogueSynthesizer(seed=123)
-    scenarios = ["normal", "double_talk", "high_leak_lt_10db", "path_drift", "third_speaker"]
+    scenarios = ["normal", "double_talk", "high_leak_lt_10db", "path_drift", "third_speaker", "no_leak"]
 
     for sc in scenarios:
         res = synth.synthesize_dialogue(duration_sec=5.0, scenario=sc)
         assert res.scenario == sc
         assert res.audio.shape == (2, int(5.0 * SAMPLE_RATE))
         if sc == "third_speaker":
-            labels_a = [s["label"] for s in res.ground_truth_intervals["A"]]
-            assert LABEL_THIRD in labels_a
+            labels = [
+                s["label"]
+                for ch in ("A", "B")
+                for s in res.ground_truth_intervals[ch]
+            ]
+            assert LABEL_THIRD in labels
+
+
+def test_no_leak_scenario_has_no_leak_labels():
+    """The no_leak scenario must produce zero `leak` frames on both tracks."""
+    synth = TelephoneDialogueSynthesizer(seed=321)
+    res = synth.synthesize_dialogue(duration_sec=6.0, scenario="no_leak")
+
+    assert res.metadata["leak_enabled_a"] is False
+    assert res.metadata["leak_enabled_b"] is False
+    for ch in ("A", "B"):
+        labels = {s["label"] for s in res.ground_truth_intervals[ch]}
+        assert LABEL_LEAK not in labels
+
+
+def test_ground_truth_follows_audible_energy_not_schedule():
+    """`own` frames must coincide with actual audible energy on the track."""
+    from src.synthesizer import frame_energy_db
+
+    synth = TelephoneDialogueSynthesizer(seed=55)
+    res = synth.synthesize_dialogue(duration_sec=6.0, scenario="normal")
+
+    track_db = frame_energy_db(res.audio[0], res.num_frames)
+    own_mask = np.zeros(res.num_frames, dtype=bool)
+    for seg in res.ground_truth_intervals["A"]:
+        if seg["label"] == LABEL_OWN:
+            s = int(round(seg["start"] / 0.010))
+            e = int(round(seg["end"] / 0.010))
+            own_mask[s:e] = True
+
+    # Every labelled own frame must be above the absolute audibility floor.
+    assert np.all(track_db[own_mask] > -52.0), "own label on a silent frame"
+    # And the label must not cover the whole recording.
+    assert 0 < own_mask.sum() < res.num_frames
+
+    # Conversely, frames far below the floor must never be labelled own.
+    silent = track_db < -60.0
+    assert not np.any(own_mask & silent)
+
+
+def test_leak_label_requires_audibility_over_noise():
+    """`leak` must only be labelled where the leak is above the track noise."""
+    synth = TelephoneDialogueSynthesizer(seed=77)
+    res = synth.synthesize_dialogue(duration_sec=8.0, scenario="normal")
+
+    # A leak attenuated by 40 dB is usually inaudible; the generator must not
+    # label it as present just because the counterpart was talking.
+    for ch in ("A", "B"):
+        for seg in res.ground_truth_intervals[ch]:
+            if seg["label"] == LABEL_LEAK:
+                assert seg["end"] > seg["start"]
+
+
+def test_third_speaker_can_appear_on_either_channel():
+    """Third speaker placement must not be hard-coded to channel A."""
+    channels = set()
+    for seed in range(12):
+        synth = TelephoneDialogueSynthesizer(seed=seed)
+        res = synth.synthesize_dialogue(
+            duration_sec=6.0, scenario="third_speaker", third_speaker_prob=1.0
+        )
+        channels.update(res.metadata["third_channels"])
+    assert channels == {"A", "B"}, f"Third speaker only appeared on {channels}"
+
+
+def test_leak_attenuation_covers_full_range():
+    """Sampled leak attenuation must span the full 6-40 dB range."""
+    synth = TelephoneDialogueSynthesizer(seed=9)
+    values = [synth._sample_attenuation_db("normal") for _ in range(400)]
+    assert min(values) <= 8.0
+    assert max(values) >= 35.0
+
+
+def test_dialogue_schedule_varies_first_speaker_and_lengths():
+    """First speaker and utterance lengths must be randomized."""
+    synth = TelephoneDialogueSynthesizer(seed=11)
+    first_speakers = set()
+    lengths = []
+    for _ in range(20):
+        events = synth._build_schedule(12.0)
+        if events:
+            first_speakers.add(events[0][0])
+            lengths.extend(d for _, _, d in events)
+    assert first_speakers == {"A", "B"}
+    assert min(lengths) >= 0.3
+    assert max(lengths) <= 4.5

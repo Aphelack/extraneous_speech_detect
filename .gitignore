@@ -17,6 +17,9 @@ data/
 *.zip
 *.opus
 
+# Assignment / task documents must never be committed
+*.docx
+
 # Audio and results
 *.wav
 *.flac
