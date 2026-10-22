@@ -244,7 +244,14 @@ class TelephoneAudioCleaner:
         own_active = (p_own >= 0.35) & (frame_energy > floor_energy)
         pure_own = leak_ext < 0.20
         pure_leak = (~own_active) & (leak_ext >= 0.25)
-        tail_pure_leak = (leak_ext >= 0.60) & (frame_energy < 0.75 * aligned_energy)
+        # A leak tail may only be muted when the owner is NOT speaking. Without
+        # the `~own_active` guard this rule silenced genuine owner speech on
+        # audio whose energy balance differs from the training generator.
+        tail_pure_leak = (
+            (leak_ext >= 0.60)
+            & (frame_energy < 0.75 * aligned_energy)
+            & (~own_active)
+        )
         pure_leak |= tail_pure_leak
         double_talk = own_active & (leak_ext >= 0.20)
 

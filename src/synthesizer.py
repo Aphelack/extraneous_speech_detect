@@ -616,6 +616,7 @@ class TelephoneDialogueSynthesizer:
         leak_delay_sec: Optional[float] = None,
         leak_attenuation_db: Optional[float] = None,
         third_speaker_prob: float = 0.5,
+        force_leak: Optional[bool] = None,
     ) -> SynthesisResult:
         """Synthesize a complete two-channel dialogue with energy-based ground truth.
 
@@ -626,6 +627,10 @@ class TelephoneDialogueSynthesizer:
             - "path_drift": leak delay tau drifts dynamically during the call
             - "third_speaker": third person talks near microphone A and/or B
             - "no_leak": no leakage at all on either track
+
+        ``force_leak`` overrides the random "20% of records have no leak" rule
+        (True = always leak on both tracks, False = never leak). It is used by
+        the listening demo and by targeted tests.
         """
         sr = self.config.sample_rate
         total_samples = int(sr * duration_sec)
@@ -702,13 +707,20 @@ class TelephoneDialogueSynthesizer:
         else:
             leak_a_enabled = True
             leak_b_enabled = True
-            # 20% of records have no leak on one or both tracks.
-            if self.rng.rand() < 0.20:
+            # 20% of records have no leak on one or both tracks. The
+            # `high_leak_lt_10db` scenario is *defined* by a severe leak, so it
+            # always keeps leakage on both tracks.
+            if scenario != "high_leak_lt_10db" and self.rng.rand() < 0.20:
                 mode = str(self.rng.choice(["A", "B", "both"]))
                 if mode in ("A", "both"):
                     leak_a_enabled = False
                 if mode in ("B", "both"):
                     leak_b_enabled = False
+
+        # Explicit override for demos / targeted tests.
+        if force_leak is not None:
+            leak_a_enabled = bool(force_leak)
+            leak_b_enabled = bool(force_leak)
 
         if leak_delay_sec is None:
             leak_delay_sec = float(self.rng.uniform(*self.config.leak_delay_range_sec))
